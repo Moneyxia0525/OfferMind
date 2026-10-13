@@ -1,0 +1,172 @@
+# Career Agent
+
+**Define an agent through three filesystem primitives:**
+
+- **Memory** (`CAREER_AGENT.md`) – persistent context like brand voice and style guidelines
+- **Skills** (`skills/*/SKILL.md`) – workflows for specific tasks, loaded on demand
+- **Subagents** (`subagents.yaml`) – specialized agents for delegated tasks like research
+
+## How It Works
+
+The agent is configured and assembled by files:
+
+```
+career_agent/
+├── agents.py                    # Graph assembly and CompositeBackend routes
+├── CAREER_AGENT.md              # Per-stage procedure (loaded as memory)
+├── prompts.py                   # Main-agent and middleware prompts
+├── middleware.py                # Model override, UTC date, and preference loading
+├── subagents.yaml               # Subagent definitions (hiring-recon, resume-tailor, interview-coach)
+├── skills/                      # Per-consumer skill grouping (one source path per agent)
+│   ├── career-agent/            # main agent
+│   │   └── interview-battlecard/
+│   │       └── SKILL.md         # Day-of one-pager workflow
+│   ├── hiring-recon/            # hiring-recon subagent
+│   │   └── hiring-recon/
+│   │       └── SKILL.md
+│   ├── resume-tailor/           # resume-tailor subagent
+│   │   └── resume-tailor/
+│   │       └── SKILL.md
+│   └── interview-coach/         # interview-coach subagent
+│       └── interview-coach/
+│           └── SKILL.md
+├── tools.py                     # Parsing, extraction, and document rendering tools
+├── object_backend.py            # ObjectStoreBackend for binary artifact routes
+├── object_storage.py            # Virtual-path ↔ object-key mapping and area registry
+├── scope.py                     # Per-user KV namespaces and object scopes
+├── sandbox_backend.py           # Local/E2B backend selection
+├── shell_backend.py             # Host subprocess backend
+├── execute_approval.py          # Human-in-the-loop policy for shell commands
+├── render_scratch.py            # Throwaway host or sandbox render directories
+├── templates/battlecard/        # WeasyPrint HTML, CSS, and fonts
+└── utils.py                     # Utilities
+```
+
+The outer folder under `skills/` is the consumer grouping (a deepagents source path); the inner folder is the skill name (matches `name:` in frontmatter). Each consumer points at its own outer folder so its `SkillsMiddleware` only loads the skills it actually uses.
+
+
+| File                | Purpose                              | When Loaded                  |
+| ------------------- | ------------------------------------ | ---------------------------- |
+| `CAREER_AGENT.md` | Stage procedures and update templates | Always (system prompt)       |
+| `subagents.yaml`    | Research and other delegated tasks   | Always (defines `task` tool) |
+| `skills/*/SKILL.md` | Content-specific workflows           | On demand                    |
+
+
+## Architecture
+
+The `memory` and `skills` parameters are handled natively by deepagents middleware. Tools are defined in the script and passed directly.
+
+**Note on subagents:** Unlike `memory` and `skills`, subagents must be defined in code. We use a small `load_subagents()` helper to externalize config to YAML. Each subagent can also declare its own `skills:` paths — deepagents constructs a dedicated `SkillsMiddleware` per subagent, so skills do not propagate from the main agent. You can also define a subagent inline:
+
+```python
+subagents=[
+    {
+        "name": "researcher",
+        "description": "Research topics before writing...",
+        "model": "anthropic:claude-sonnet-5",
+        "system_prompt": "You are a research assistant. Read the `web-research` skill for the full workflow, then execute it using user inputs.",
+        "tools": [web_search],
+        "skills": ["skills/researcher/"],
+    }
+],
+```
+
+**Flow:**
+
+1. Agent asks user for resume, JD, prep timeline, and any extra context.
+2.1. User uploads resume and optional JD → saves to `/upload/`.
+2.2. Agent processes the uploaded documents → saves to `/processed/<slug>.md`. Persists intake answers to `/processed/<resume>-<jd>-intake.md`. Reads both processed files in full so it has substance for delegating downstream stages.
+3. Delegates to `hiring-recon` subagent → company + role intel + match analysis → saves to `/research/<resume>/<jd>.md`.
+4.1. Delegates to `resume-tailor` subagent → tailored resume YAML at `/tailored_resume/<resume>/<jd>.yaml` (source of truth, user-editable), then `render_resume_pdf` renders in a throwaway temp dir and publishes the `.pdf` + `.typ` siblings next to the YAML.
+4.2. In parallel with 4.1, delegates to `interview-coach` subagent → structured prep doc with self-introduction + per-round STAR stories → saves to `/interview_coach/<resume>/<jd>.md`.
+5. Agent loads `/skills/interview-battlecard/SKILL.md`, reads the tailored resume + interview-coach prep + research report, writes a one-page-per-round battlecard as JSON at `/interview_battlecard/<resume>/<jd>.json` (LLM-written, user-editable source of truth), then calls `render_battlecard_pdf` to produce a `.pdf` sibling for download.
+
+
+## Multi-turn updates
+
+Once the five stages have run, users iterate ("add a round", "drop this link", "add common questions to round 2"). The main agent routes by which file owns the change: it edits `/interview_battlecard/<r>/<j>.json` itself (read → `edit_file` or `write_file` → `render_battlecard_pdf`), and delegates research / tailored-resume / interview-prep updates to the matching subagent with an explicit "update" task description that names the target path and the surgical change. Subagents read the existing file first, preserve everything the user did not name, and reply with `Updated … at: <path>`. Skill-level preservation defaults (don't drop a skill, don't drop a URL, etc.) yield to explicit user requests; truth/fabrication rules stay absolute. See `CAREER_AGENT.md` "Stage 6 — Updates" for the full procedure and task-input templates.
+
+
+## Human-in-the-loop: `execute` approval
+
+The `execute` tool runs LLM-authored bash — on the host with `SANDBOX_PROVIDER=local`
+(default), inside a remote E2B microVM with `e2b` (see `sandbox_backend.py` and
+`deploy/cubesandbox/`) — so risky commands pause the run for human review in **both** modes:
+isolation contains blast radius, not exfiltration or API misuse. `build_career_agent` passes
+`interrupt_on={"execute": ...}` (built by
+`execute_approval.py`) to `create_deep_agent`, which installs langchain's
+`HumanInTheLoopMiddleware` on the main agent and threads the same config into every
+declarative subagent plus the auto-added general-purpose one — main agent and subagents
+pause alike. The frontend renders the pending command with **Approve / Edit / Reject**;
+the decision resumes the run via the server's interrupt/resume flow (the platform
+checkpointer makes this durable — never pass `checkpointer=` to `create_deep_agent`).
+
+- **Auto-approve allowlist:** `is_auto_approvable` clears short commands that invoke a
+  read-only binary (`ls`, `cat`, `grep`, ...) with no shell control/substitution
+  characters, no absolute paths, and no `..` traversal. Everything else interrupts —
+  the classifier fails closed.
+- **Intentional bypass:** `render_resume_pdf` calls `backend.execute()` directly with a
+  developer-authored `rendercv render` command; it never passes the tool layer, so it is
+  not gated.
+- **Kill switch:** `CAREER_AGENT_EXECUTE_APPROVAL=false` (see `.env.example`) disables
+  the gate for offline evals or rollback. Default on.
+
+## File Upload (v1)
+
+Users upload raw resume / JD files (PDF, DOC, DOCX, TXT, MD; up to 10 MB each) from
+the frontend in two places:
+
+- **Chat composer** — paperclip icon in the message input.
+- **Workspace > Files** — Upload button in the section header.
+
+Both surfaces POST `multipart/form-data` to the backend files API
+(`/files/upload`, served by `backend/agents/files_api.py` via the agent
+server's `LANGGRAPH_HTTP` custom-app hook), which validates the extension,
+size, and path prefix, then stores the bytes in the object store at
+`users/<scope>/career_agent/upload/<filename>` (`<scope>` is the authenticated user id, or
+`default` in single-user mode). The agent's
+`ObjectStoreBackend` route (`/upload/`) sees the file on its next tool call.
+
+Re-uploading the same filename overwrites within that user's scope. Files are per-user but not
+per-thread.
+
+## Virtual File Structure
+
+```
+/upload/                                                      # ObjectStoreBackend
+├── Senior AI Engineer - Tam NGUYEN.pdf                       # Uploaded resume
+└── AWS AI Solution Engineer.pdf                              # Uploaded JD
+
+/memory/                                                      # StoreBackend
+└── preferences.md                                            # Standing user preferences
+
+/processed/                                                   # StoreBackend
+├── tam-nguyen-senior-ai-engineer-resume.md                   # Processed resume
+├── aws-ai-solution-engineer-jd.md                            # Processed JD
+└── tam-nguyen-senior-ai-engineer-resume-aws-ai-solution-engineer-jd-intake.md  # Intake (per resume×JD pair)
+
+/research/                                                    # StoreBackend
+└── tam-nguyen-senior-ai-engineer-resume/
+    └── aws-ai-solution-engineer-jd.md                        # hiring-recon report
+
+/tailored_resume/                                             # ObjectStoreBackend
+└── tam-nguyen-senior-ai-engineer-resume/
+    ├── aws-ai-solution-engineer-jd.yaml                      # rendercv source (LLM-written, user-editable)
+    ├── aws-ai-solution-engineer-jd.pdf                       # rendercv-generated PDF
+    └── aws-ai-solution-engineer-jd.typ                       # rendercv Typst intermediate (never cited in replies)
+
+/interview_coach/                                             # StoreBackend
+└── tam-nguyen-senior-ai-engineer-resume/
+    └── aws-ai-solution-engineer-jd.md                        # interview-coach output
+
+/interview_battlecard/                                        # ObjectStoreBackend
+└── tam-nguyen-senior-ai-engineer-resume/
+    ├── aws-ai-solution-engineer-jd.json                      # weasyprint source (LLM-written, user-editable)
+    └── aws-ai-solution-engineer-jd.pdf                       # weasyprint-rendered day-of cheat sheet
+
+/workspace/                                                   # StoreBackend — ad-hoc working files
+
+/large_tool_results/                                          # StoreBackend — deepagents result offload
+```
+
+Note: both the tailored resume and the interview battlecard follow the same source-then-render pattern. Tailored resumes use `rendercv` (YAML → `.typ` intermediate → `.pdf`, via the one-shot `render_resume_pdf` tool, which hydrates a scratch copy, renders, and publishes — the throwaway scratch dir lives on the host in `local` sandbox mode and inside the sandbox in `e2b` mode; see `render_scratch.py`). Battlecards use `weasyprint` (JSON → `.pdf`, via `render_battlecard_pdf`). The JSON / YAML side is the user-editable source of truth; the PDF is regenerated on demand. `/upload/`, `/tailored_resume/`, and `/interview_battlecard/` live in S3-compatible object storage (SeaweedFS locally; S3/GCS/Azure in the cloud) under deterministic keys — `users/<scope>/career_agent/<area>/<relpath>` — so binary PDFs live neither on shared disk nor in Postgres.

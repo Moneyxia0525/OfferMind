@@ -1,0 +1,19 @@
+project_doc_fallback_filenames = ["CLAUDE.md"]
+
+[mcp_servers.openaiDeveloperDocs]
+url = "https://developers.openai.com/mcp"
+
+[mcp_servers.github]
+url = "https://api.githubcopilot.com/mcp/"
+bearer_token_env_var = "PERSONAL_GITHUB_PAT_TOKEN"
+
+[mcp_servers.docs-langchain]
+url = "https://docs.langchain.com/mcp"
+
+[mcp_servers.offermind-postgres]
+command = "sh"
+args = [
+    "-lc",
+    'set -a; . ./.env; set +a; exec npx -y @bytebase/dbhub --dsn "postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@localhost:$POSTGRES_LOCAL_PORT/$POSTGRES_DB"',
+]
+cwd = "."

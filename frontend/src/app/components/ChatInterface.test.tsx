@@ -1,0 +1,541 @@
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import React from "react";
+import { toast } from "sonner";
+import { AIMessage, HumanMessage, ToolMessage, type BaseMessage } from "@langchain/core/messages";
+import type { Assistant } from "@langchain/langgraph-sdk";
+import type { ToolCall } from "@/app/types/types";
+import { ChatInterface } from "./ChatInterface";
+
+// ---------------------------------------------------------------------------
+// Mocks
+// ---------------------------------------------------------------------------
+
+// ChatInterface owns no composer state — `input`/`setInput` live on the chat
+// context — so the mock hook keeps the input in real React state to make
+// typing, suggestion fills, and post-send clearing observable.
+const sendMessage = vi.fn();
+const stopStream = vi.fn();
+const resumeInterrupt = vi.fn();
+const refreshFiles = vi.fn(async () => {});
+const appendUploadNote = vi.fn();
+
+const ctx: {
+  messages: BaseMessage[];
+  isLoading: boolean;
+  isThreadLoading: boolean;
+  files: Record<string, string>;
+  filesReady: boolean;
+  interrupts: { id: string; value: unknown }[];
+  threadInterrupts: { interruptId: string; payload: unknown; namespace: string[] }[];
+} = {
+  messages: [],
+  isLoading: false,
+  isThreadLoading: false,
+  files: {},
+  filesReady: true,
+  interrupts: [],
+  threadInterrupts: [],
+};
+
+function useMockChatContext() {
+  const [input, setInput] = React.useState("");
+  return {
+    // getThread backs useInterruptApprovals' live-subagent fallback source.
+    stream: { getThread: () => ({ interrupts: ctx.threadInterrupts }), subagents: new Map() },
+    messages: ctx.messages,
+    isLoading: ctx.isLoading,
+    isThreadLoading: ctx.isThreadLoading,
+    files: ctx.files,
+    filesReady: ctx.filesReady,
+    interrupts: ctx.interrupts,
+    sendMessage,
+    stopStream,
+    resumeInterrupt,
+    input,
+    setInput,
+    focusComposerNonce: 0,
+    refreshFiles,
+    appendUploadNote,
+  };
+}
+
+vi.mock("@/providers/ChatProvider", () => ({
+  useChatContext: () => useMockChatContext(),
+}));
+
+vi.mock("sonner", () => ({
+  toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn(), info: vi.fn() },
+  Toaster: () => null,
+}));
+
+const uploadAgentFilesMock = vi.hoisted(() =>
+  vi.fn(async () => ({ uploaded: [] as { path: string; size: number }[], errors: [] }))
+);
+vi.mock("@/app/lib/uploadFiles", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/app/lib/uploadFiles")>();
+  return { ...actual, uploadAgentFiles: uploadAgentFilesMock };
+});
+
+vi.mock("@/app/components/ChatMessage", () => ({
+  ChatMessage: ({
+    message,
+    toolCalls,
+    toolBatches,
+    isOpenEndedGroup,
+  }: {
+    message: BaseMessage;
+    toolCalls: ToolCall[];
+    toolBatches?: ToolCall[][] | null;
+    isOpenEndedGroup?: boolean;
+  }) => (
+    <div
+      data-testid="chat-message"
+      data-batches={
+        toolBatches ? JSON.stringify(toolBatches.map((b) => b.map((tc) => tc.name))) : ""
+      }
+      data-statuses={JSON.stringify(toolCalls.map((tc) => [tc.id, tc.status]))}
+      data-open-ended={isOpenEndedGroup ? "yes" : "no"}
+    >
+      {message.id}
+    </div>
+  ),
+}));
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+const assistant = { assistant_id: "assistant-1", graph_id: "career_agent" } as unknown as Assistant;
+
+function renderChat(overrides: Partial<Assistant> = {}) {
+  // use-stick-to-bottom runs for real in every render (ResizeObserver/scrollTo
+  // polyfills come from vitest.setup.ts) — rendering without crashing is the
+  // smoke assertion for it.
+  return render(<ChatInterface assistant={{ ...assistant, ...overrides }} />);
+}
+
+const composer = () => screen.getByPlaceholderText(/给 OfferMind 发消息/);
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  localStorage.clear();
+  ctx.messages = [];
+  ctx.isLoading = false;
+  ctx.isThreadLoading = false;
+  ctx.files = {};
+  ctx.filesReady = true;
+  ctx.interrupts = [];
+  ctx.threadInterrupts = [];
+});
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe("ChatInterface", () => {
+  it("sends the trimmed composer text on Enter and clears the input", async () => {
+    const user = userEvent.setup();
+    renderChat();
+    const textarea = composer();
+
+    await user.type(textarea, "  hello world  ");
+    await user.keyboard("{Enter}");
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith("hello world");
+    expect(textarea).toHaveValue("");
+  });
+
+  it("inserts a newline on Shift+Enter instead of sending", async () => {
+    const user = userEvent.setup();
+    renderChat();
+    const textarea = composer();
+
+    await user.type(textarea, "line one");
+    await user.keyboard("{Shift>}{Enter}{/Shift}line two");
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(textarea).toHaveValue("line one\nline two");
+  });
+
+  it("disables Send and ignores Enter while the composer is empty or whitespace", async () => {
+    const user = userEvent.setup();
+    renderChat();
+    const sendButton = screen.getByRole("button", { name: "发送" });
+    expect(sendButton).toBeDisabled();
+
+    const textarea = composer();
+    await user.type(textarea, "   ");
+    expect(sendButton).toBeDisabled();
+
+    await user.keyboard("{Enter}");
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(textarea).toHaveValue("   ");
+  });
+
+  it("shows the stop control while streaming and stops the stream on click", async () => {
+    const user = userEvent.setup();
+    ctx.isLoading = true;
+    renderChat();
+
+    expect(screen.getByText(/OfferMind 正在处理/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "发送" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "停止" }));
+    expect(stopStream).toHaveBeenCalledTimes(1);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("renders one ChatMessage per human/AI message, in order", () => {
+    ctx.messages = [
+      new HumanMessage({ id: "h1", content: "hi" }),
+      new AIMessage({ id: "a1", content: "hello" }),
+    ];
+    renderChat();
+
+    const stubs = screen.getAllByTestId("chat-message");
+    expect(stubs).toHaveLength(2);
+    expect(stubs[0]).toHaveTextContent("h1");
+    expect(stubs[1]).toHaveTextContent("a1");
+    expect(screen.queryByRole("heading", { name: /更快拿到.*下一份工作/ })).not.toBeInTheDocument();
+  });
+
+  it("shows the welcome empty state and fills the composer from a suggestion chip", async () => {
+    const user = userEvent.setup();
+    renderChat();
+
+    expect(screen.getByRole("heading", { name: /更快拿到.*下一份工作/ })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /优化我的简历/ }));
+    expect(composer()).toHaveValue("请根据具体职位描述优化我的简历。");
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("shows the thread-loading placeholder instead of messages or the hero", () => {
+    ctx.isThreadLoading = true;
+    renderChat();
+
+    expect(screen.getByText("加载中…")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: /更快拿到.*下一份工作/ })).not.toBeInTheDocument();
+  });
+
+  // COMPOSER_ATTACH_ENABLED is hardcoded to false in the component, so the
+  // paperclip button never renders. The hidden file input DOES render — it's
+  // shared with the hero upload CTA — but nothing in the composer reaches it.
+  it("renders no attach control while the composer paperclip flag is off", () => {
+    renderChat();
+
+    expect(screen.queryByTitle("附加文件")).not.toBeInTheDocument();
+    expect(document.querySelector('input[type="file"]')).not.toBeNull();
+    expect(uploadAgentFilesMock).not.toHaveBeenCalled();
+    expect(appendUploadNote).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// First-run upload CTA (hero dropzone)
+// ---------------------------------------------------------------------------
+
+describe("ChatInterface first-run upload CTA", () => {
+  const cta = () => screen.queryByRole("button", { name: /添加你的简历或职位描述/ });
+
+  it("features the upload card in the hero for a fresh user", () => {
+    renderChat();
+    expect(cta()).toBeInTheDocument();
+  });
+
+  it("hides the card until the file list is ready (no returning-user flash)", () => {
+    ctx.filesReady = false;
+    renderChat();
+    expect(screen.getByRole("heading", { name: /更快拿到.*下一份工作/ })).toBeInTheDocument();
+    expect(cta()).not.toBeInTheDocument();
+  });
+
+  it("hides the card once the user has an upload", () => {
+    ctx.files = { "/upload/cv.pdf": "…" };
+    renderChat();
+    expect(cta()).not.toBeInTheDocument();
+  });
+
+  it("keeps the card when only agent-generated files exist", () => {
+    ctx.files = { "/tailored_resume/v1.md": "…" };
+    renderChat();
+    expect(cta()).toBeInTheDocument();
+  });
+
+  it("uploads accepted files on drop and reports skipped ones", async () => {
+    renderChat();
+    const pdf = new File(["x"], "cv.pdf", { type: "application/pdf" });
+    const exe = new File(["x"], "setup.exe", { type: "application/octet-stream" });
+
+    fireEvent.drop(cta()!, { dataTransfer: { files: [pdf, exe] } });
+
+    await waitFor(() => expect(uploadAgentFilesMock).toHaveBeenCalledTimes(1));
+    expect(uploadAgentFilesMock).toHaveBeenCalledWith({ files: [pdf], targetDir: "/upload" });
+    expect(toast.error).toHaveBeenCalledWith(expect.stringContaining("已跳过 1 个不支持的文件"));
+    await act(async () => {});
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tool-call run grouping (computed here, rendered by ToolCallGroup)
+// ---------------------------------------------------------------------------
+
+const aiWithTools = (
+  id: string,
+  tools: Array<{ id: string; name: string }>,
+  content = ""
+): AIMessage =>
+  new AIMessage({
+    id,
+    content,
+    tool_calls: tools.map((t) => ({ id: t.id, name: t.name, args: {}, type: "tool_call" })),
+  });
+
+const toolResult = (callId: string): ToolMessage =>
+  new ToolMessage({ content: "ok", tool_call_id: callId });
+
+const batchesOf = (stub: HTMLElement) => stub.getAttribute("data-batches");
+
+describe("ChatInterface tool-call run grouping", () => {
+  it("merges consecutive AI tool messages into the head's batches", () => {
+    ctx.messages = [
+      aiWithTools("m1", [
+        { id: "t1", name: "read_file" },
+        { id: "t2", name: "read_file" },
+      ]),
+      toolResult("t1"),
+      toolResult("t2"),
+      aiWithTools("m2", [{ id: "t3", name: "edit_file" }]),
+      toolResult("t3"),
+      new AIMessage({ id: "m3", content: "done" }),
+    ];
+    renderChat();
+
+    const [m1, m2, m3] = screen.getAllByTestId("chat-message");
+    expect(batchesOf(m1)).toBe('[["read_file","read_file"],["edit_file"]]');
+    expect(batchesOf(m2)).toBe("");
+    expect(batchesOf(m3)).toBe("");
+  });
+
+  it("breaks a run on prose before its own tools and on a subagent spawn after them", () => {
+    ctx.messages = [
+      aiWithTools("m1", [{ id: "t1", name: "read_file" }]),
+      toolResult("t1"),
+      // Prose renders above this message's own tools → new head here.
+      aiWithTools("m2", [{ id: "t2", name: "edit_file" }], "Let me update that."),
+      toolResult("t2"),
+      // Its regular call joins m2's run; the subagent card then ends it.
+      new AIMessage({
+        id: "m3",
+        content: "",
+        tool_calls: [
+          { id: "t3", name: "list_files", args: {}, type: "tool_call" },
+          { id: "task1", name: "task", args: { subagent_type: "researcher" }, type: "tool_call" },
+        ],
+      }),
+      toolResult("t3"),
+      aiWithTools("m4", [{ id: "t4", name: "execute" }]),
+      toolResult("t4"),
+    ];
+    renderChat();
+
+    const [m1, m2, m3, m4] = screen.getAllByTestId("chat-message");
+    expect(batchesOf(m1)).toBe('[["read_file"]]');
+    expect(batchesOf(m2)).toBe('[["edit_file"],["list_files"]]');
+    expect(batchesOf(m3)).toBe("");
+    expect(batchesOf(m4)).toBe('[["execute"]]');
+  });
+
+  it("flags only a transcript that ends inside a run as open-ended", () => {
+    ctx.messages = [aiWithTools("m1", [{ id: "t1", name: "read_file" }])];
+    ctx.isLoading = true;
+    renderChat();
+    expect(screen.getByTestId("chat-message")).toHaveAttribute("data-open-ended", "yes");
+  });
+
+  it("clears the open-ended flag once prose follows the run", () => {
+    ctx.messages = [
+      aiWithTools("m1", [{ id: "t1", name: "read_file" }]),
+      toolResult("t1"),
+      new AIMessage({ id: "m2", content: "All set." }),
+    ];
+    ctx.isLoading = true;
+    renderChat();
+
+    const [m1, m2] = screen.getAllByTestId("chat-message");
+    expect(m1).toHaveAttribute("data-open-ended", "no");
+    expect(m2).toHaveAttribute("data-open-ended", "no");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HITL approvals (derived here via useInterruptApprovals)
+// ---------------------------------------------------------------------------
+
+const executeAI = (id: string, calls: Array<{ id: string; command: string }>): AIMessage =>
+  new AIMessage({
+    id,
+    content: "",
+    tool_calls: calls.map((c) => ({
+      id: c.id,
+      name: "execute",
+      args: { command: c.command },
+      type: "tool_call",
+    })),
+  });
+
+const hitlValue = (commands: string[]) => ({
+  action_requests: commands.map((command) => ({
+    name: "execute",
+    args: { command },
+    description: "执行前请审核。",
+  })),
+  review_configs: commands.map(() => ({
+    action_name: "execute",
+    allowed_decisions: ["approve", "edit", "reject"],
+  })),
+});
+
+const statusesOf = (stub: HTMLElement) =>
+  JSON.parse(stub.getAttribute("data-statuses") ?? "[]") as [string, string][];
+
+describe("ChatInterface HITL approvals", () => {
+  it("marks only the approval's own tool call interrupted, not parallel siblings", () => {
+    ctx.messages = [
+      executeAI("m1", [
+        { id: "t1", command: "ls" },
+        { id: "t2", command: "id" },
+      ]),
+    ];
+    // One gated call: the `when` allowlist auto-approved `ls`, so the
+    // interrupt carries only the `id` action_request.
+    ctx.interrupts = [{ id: "int1", value: hitlValue(["id"]) }];
+    renderChat();
+
+    const statuses = new Map(statusesOf(screen.getByTestId("chat-message")));
+    expect(statuses.get("t2")).toBe("interrupted");
+    expect(statuses.get("t1")).toBe("pending");
+  });
+
+  it("accumulates one decision per action and resumes once with the ordered batch", async () => {
+    const user = userEvent.setup();
+    // The last AI turn is a task call (unresolved), so the two execute
+    // approvals have no matching root box and render in the fallback block.
+    ctx.messages = [
+      new AIMessage({
+        id: "m1",
+        content: "",
+        tool_calls: [
+          {
+            id: "task1",
+            name: "task",
+            args: { subagent_type: "general-purpose" },
+            type: "tool_call",
+          },
+        ],
+      }),
+    ];
+    ctx.interrupts = [{ id: "int1", value: hitlValue(["id", "uname -a"]) }];
+    renderChat();
+
+    const approveButtons = screen.getAllByRole("button", { name: "批准" });
+    expect(approveButtons).toHaveLength(2);
+
+    await user.click(approveButtons[0]);
+    // First decision queues — no resume yet.
+    expect(resumeInterrupt).not.toHaveBeenCalled();
+    expect(screen.getByText("已批准 — 已排队")).toBeInTheDocument();
+    expect(screen.getByText("还需等待 1 个决定")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "批准" }));
+    expect(resumeInterrupt).toHaveBeenCalledTimes(1);
+    expect(resumeInterrupt).toHaveBeenCalledWith(
+      { decisions: [{ type: "approve" }, { type: "approve" }] },
+      { interruptId: "int1", namespace: undefined }
+    );
+  });
+
+  it("surfaces a live subagent interrupt from the ThreadStream record and resumes with its namespace", async () => {
+    const user = userEvent.setup();
+    ctx.messages = [
+      new AIMessage({
+        id: "m1",
+        content: "",
+        tool_calls: [
+          {
+            id: "task1",
+            name: "task",
+            args: { subagent_type: "general-purpose" },
+            type: "tool_call",
+          },
+        ],
+      }),
+    ];
+    // Live subagent interrupts never reach `interrupts` — only the
+    // ThreadStream record has them.
+    ctx.interrupts = [];
+    ctx.threadInterrupts = [
+      { interruptId: "int9", payload: hitlValue(["id"]), namespace: ["task:task1"] },
+    ];
+    renderChat();
+
+    expect(screen.getByText("需要审批")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "批准" }));
+
+    expect(resumeInterrupt).toHaveBeenCalledWith(
+      { decisions: [{ type: "approve" }] },
+      { interruptId: "int9", namespace: ["task:task1"] }
+    );
+  });
+
+  it("locks the composer while a review is pending (input would be coerced to a resume)", async () => {
+    const user = userEvent.setup();
+    ctx.messages = [executeAI("m1", [{ id: "t1", command: "id" }])];
+    ctx.interrupts = [{ id: "int1", value: hitlValue(["id"]) }];
+    renderChat();
+
+    expect(screen.getByText(/等待你的审核/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+
+    await user.type(composer(), "never mind");
+    await user.keyboard("{Enter}");
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("ignores replayed thread interrupts while a run is streaming", () => {
+    ctx.messages = [executeAI("m1", [{ id: "t1", command: "id" }])];
+    ctx.isLoading = true;
+    ctx.threadInterrupts = [{ interruptId: "stale1", payload: hitlValue(["id"]), namespace: [] }];
+    renderChat();
+
+    expect(screen.queryByText("需要审批")).not.toBeInTheDocument();
+    const statuses = new Map(statusesOf(screen.getByTestId("chat-message")));
+    expect(statuses.get("t1")).toBe("pending");
+  });
+});
+
+describe("per-agent empty state", () => {
+  it("greets analytics users with analytics copy and prompts", () => {
+    // Career copy under the analytics agent would simply be wrong.
+    renderChat({ graph_id: "analytics_agent" });
+
+    expect(screen.getByText("你的产品")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /LLM 成本/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /优化我的简历/ })).not.toBeInTheDocument();
+  });
+
+  it("hides the resume upload cue for an agent that takes no files", () => {
+    renderChat({ graph_id: "analytics_agent" });
+
+    expect(screen.queryByText(/添加你的简历/)).not.toBeInTheDocument();
+  });
+
+  it("keeps the career empty state for the career agent", () => {
+    renderChat({ graph_id: "career_agent" });
+
+    expect(screen.getByText("下一份工作")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /优化我的简历/ })).toBeInTheDocument();
+  });
+});

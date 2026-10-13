@@ -1,0 +1,114 @@
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # .ua/ is a generated knowledge graph — keep it byte-identical to what
+      # the generator wrote (gitleaks & large-file checks still cover it).
+      - id: trailing-whitespace
+        exclude: '\.(svg|csv)$|^\.ua/'
+      - id: end-of-file-fixer
+        exclude: '\.(svg|csv)$|^\.ua/'
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ["--maxkb=2500"]
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.6
+    hooks:
+      # Generated protobuf/gRPC stubs are excluded here as well as in ruff's own
+      # config: pre-commit passes filenames explicitly, which bypasses
+      # [tool.ruff] exclude (an F401 autofix once stripped the side-effect
+      # empty_pb2 imports that register well-known types in the descriptor pool).
+      - id: ruff-check
+        name: Backend Ruff Lint
+        args: [--fix, --exit-non-zero-on-fix]
+        types_or: [ python, pyi, jupyter, pyproject ]
+        exclude: ^backend/server/grpc_common/proto/
+      - id: ruff-format
+        name: Backend Ruff Format
+        types_or: [ python, pyi, jupyter, pyproject ]
+        exclude: ^backend/server/grpc_common/proto/
+
+  - repo: local
+    hooks:
+      - id: backend-typecheck
+        name: Backend Type Check
+        # cd so ty discovers backend/pyproject.toml ([tool.ty.src] excludes the
+        # server package dirs); from the repo root it would find no config.
+        entry: bash -c 'cd backend && uv run ty check'
+        language: system
+        files: ^backend/
+        types_or: [python, pyi, jupyter, pyproject]
+        pass_filenames: false
+
+      - id: analytics-typecheck
+        name: Analytics Type Check
+        # Same cd-for-config-discovery pattern as backend-typecheck; the ruff
+        # hooks above already cover analytics/ (config in analytics/pyproject.toml).
+        entry: bash -c 'cd analytics && uv run ty check'
+        language: system
+        files: ^analytics/
+        types_or: [python, pyi, jupyter, pyproject]
+        pass_filenames: false
+
+      # dbt SQL: sqlfluff with the curated `core` rules on the ClickHouse dialect
+      # (config in analytics/pyproject.toml [tool.sqlfluff.*]). fix auto-formats/fixes (a modified file
+      # fails the run — re-stage and commit, like ruff --fix); lint reports
+      # whatever isn't auto-fixable.
+      - id: analytics-sqlfluff-fix
+        name: Analytics SQL Fix (sqlfluff)
+        entry: bash -c 'cd analytics && uv run sqlfluff fix --nocolor "${@#analytics/}"' --
+        language: system
+        files: ^analytics/.*\.sql$
+
+      - id: analytics-sqlfluff-lint
+        name: Analytics SQL Lint (sqlfluff)
+        entry: bash -c 'cd analytics && uv run sqlfluff lint --nocolor "${@#analytics/}"' --
+        language: system
+        files: ^analytics/.*\.sql$
+
+      - id: frontend-lint
+        name: Frontend ESLint
+        entry: bash -c 'cd frontend && pnpm exec eslint --fix "${@#frontend/}"' --
+        language: system
+        files: ^frontend/
+        types_or: [javascript, jsx, ts, tsx]
+
+      - id: frontend-format
+        name: Frontend Prettier Format
+        entry: bash -c 'cd frontend && pnpm exec prettier --write --ignore-unknown "${@#frontend/}"' --
+        language: system
+        files: ^frontend/
+        types_or: [javascript, jsx, ts, tsx, json, yaml, markdown, css, scss]
+
+      - id: frontend-typecheck
+        name: Frontend Type Check
+        entry: pnpm --dir frontend type-check
+        language: system
+        files: ^frontend/
+        types_or: [ts, tsx]
+        pass_filenames: false
+
+      - id: frontend-langchain-sdk-sync
+        name: Frontend LangChain SDK sync
+        entry: node frontend/scripts/check-langchain-sdk-sync.mjs
+        language: system
+        files: ^frontend/(package\.json|pnpm-lock\.yaml)$
+        pass_filenames: false
+
+      # Claude Code skills (.claude/skills) and their Codex mirrors (.agents/skills)
+      # must stay byte-identical, or the two agents get conflicting instructions
+      # for the same task. The script explains each mismatch and prints the fix.
+      - id: skill-mirror-sync
+        name: Skill mirror sync (.claude <-> .agents)
+        entry: scripts/check-skill-mirrors.sh
+        language: script
+        files: ^(\.claude|\.agents)/skills/
+        pass_filenames: false

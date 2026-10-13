@@ -1,0 +1,691 @@
+volumes:
+  pg-data:
+    driver: local
+  seaweed-data:
+    driver: local
+  clickhouse-data:
+    driver: local
+  dagster-home-data:
+    driver: local
+  superset-home-data:
+    driver: local
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    working_dir: /deps/offermind/frontend
+    # Self-heal node_modules against the host's pnpm-lock.yaml on every boot,
+    # then start the dev server. Lets `pnpm add` on the host take effect via a
+    # plain `docker compose restart frontend` — no rebuild, no volume nuking.
+    # When the lockfile is already in sync this is a fast no-op.
+    command: sh -c "pnpm install --frozen-lockfile && pnpm dev --hostname 0.0.0.0"
+    ports:
+      - "${FRONTEND_LOCAL_PORT}:3000"
+    environment:
+      PORT: 3000
+      NEXT_PUBLIC_LANGGRAPH_DEPLOYMENT_URL: ${NEXT_PUBLIC_LANGGRAPH_DEPLOYMENT_URL}
+      NEXT_PUBLIC_LANGGRAPH_ASSISTANT_ID: ${NEXT_PUBLIC_LANGGRAPH_ASSISTANT_ID}
+      NEXT_PUBLIC_LANGSMITH_API_KEY: ${NEXT_PUBLIC_LANGSMITH_API_KEY}
+      # --- Multi-user auth (opt-in; unset keeps zero-login single-user mode) ---
+      NEXT_PUBLIC_AUTH_ENABLED: ${AUTH_ENABLED:-false}
+      NEXT_PUBLIC_AUTH_GOOGLE_ENABLED: ${AUTH_GOOGLE_ENABLED:-false}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-}
+      BETTER_AUTH_URL: http://localhost:${FRONTEND_LOCAL_PORT}
+      AUTH_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      GOOGLE_AUTH_CLIENT_ID: ${GOOGLE_AUTH_CLIENT_ID:-}
+      GOOGLE_AUTH_CLIENT_SECRET: ${GOOGLE_AUTH_CLIENT_SECRET:-}
+      # Pin pnpm's content-addressed store inside the container layer so it
+      # doesn't spill into the bind-mounted project as `.pnpm-store/`. (pnpm
+      # falls back to a project-local store when its default location is on a
+      # different filesystem than node_modules — which is exactly the case
+      # inside this container.)
+      PNPM_HOME: /root/.pnpm
+      npm_config_store_dir: /root/.pnpm/store
+      # Lets pnpm purge a stale `node_modules` (e.g. when the store path
+      # changes) without prompting for confirmation — there's no TTY here.
+      CI: "true"
+    volumes:
+      - .:/deps/offermind
+      - /deps/offermind/frontend/node_modules
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://localhost:3000/').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\"",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:8
+    ports:
+      - "${REDIS_LOCAL_PORT}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 1s
+      retries: 5
+
+  postgres:
+    image: pgvector/pgvector:pg18
+    ports:
+      - "${POSTGRES_LOCAL_PORT}:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pg-data:/var/lib/postgresql/18/docker
+      - ./backend/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U offermind"]
+      start_period: 10s
+      timeout: 1s
+      retries: 5
+      interval: 60s
+      start_interval: 1s
+
+  # S3-compatible object storage for binary artifacts (uploads + rendered
+  # PDFs). SeaweedFS all-in-one: master (9333), volume, filer (8888, browsable
+  # UI), S3 gateway (8333). No -s3.config -> auth is disabled, so the dev
+  # OBJECT_STORE_* credentials are accepted but not enforced (private compose
+  # network only; real creds/IAM arrive with cloud provisioning).
+  object-store:
+    image: chrislusf/seaweedfs:4.22
+    command: server -s3 -dir=/data -ip.bind=0.0.0.0
+    ports:
+      - "${OBJECT_STORE_LOCAL_PORT}:8333"
+      - "${OBJECT_STORE_UI_LOCAL_PORT}:8888"
+    volumes:
+      - seaweed-data:/data
+    healthcheck:
+      # Master healthz; the init container's retry loop covers the short gap
+      # until the S3 gateway itself accepts requests.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9333/cluster/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+      start_interval: 1s
+
+  # One-shot bucket bootstrap (S3 CreateBucket is not in obstore's scope, and
+  # SeaweedFS only auto-creates buckets for authenticated admins). Reuses the
+  # backend image purely for curl — anonymous PUT works because auth is
+  # disabled above. GET on the bucket root (ListObjects) probes existence.
+  object-store-init:
+    image: offermind-backend:local
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: "no"
+    depends_on:
+      object-store:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        for i in $(seq 1 60); do
+        curl -sf -o /dev/null "http://object-store:8333/${OBJECT_STORE_BUCKET}" && exit 0;
+        curl -sf -X PUT -o /dev/null "http://object-store:8333/${OBJECT_STORE_BUCKET}" && exit 0;
+        sleep 1;
+        done;
+        echo "object-store bucket init failed" >&2; exit 1
+
+  # The gRPC data plane of the agent server (backend/server/core_server/).
+  # Owns all assistant/thread/run/cron SQL and the Redis queue doorbell/pub-sub
+  # fan-out; the backend blocks at boot until this is reachable. Same image as
+  # the backend, different command. Internal-only — no host port. Code edits
+  # under backend/server/core_server/ or backend/server/grpc_common/ need a
+  # `docker compose restart core-server` (no hot reload here).
+  core-server:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: offermind-backend:local
+    restart: on-failure
+    command: ["python", "-m", "server.core_server"]
+    volumes:
+      - .:/deps/offermind
+      - /deps/offermind/backend/.venv
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      CORE_SERVER_BIND: 0.0.0.0:50052
+      # Default is a Go-binary fallback at localhost:50051; empty disables it —
+      # all RPCs are served natively by the Python implementation.
+      CORE_SERVER_GO_FALLBACK: ""
+      CORE_SERVER_POSTGRES_URI: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      CORE_SERVER_REDIS_URI: redis://redis:6379
+      # Only used to enumerate registered graph ids (assistant scoping); the
+      # graph itself is loaded by the backend service.
+      LANGSERVE_GRAPHS: >-
+        {
+          "career_agent": "/deps/offermind/backend/agents/career_agent/agents.py:career_agent",
+          "analytics_agent": "/deps/offermind/backend/agents/analytics_agent/agents.py:analytics_agent"
+        }
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; socket.create_connection(('localhost', 50052), 2)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+      start_interval: 1s
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: offermind-backend:local
+    restart: on-failure
+    # Image CMD + --reload: uvicorn/watchfiles watches the bind-mounted source,
+    # so backend code edits (agents/ and server packages alike) hot-reload.
+    command: ["uvicorn", "server.api.server:app",
+              "--log-config", "server/logging.json",
+              "--host", "0.0.0.0", "--port", "8000",
+              "--no-access-log",
+              "--timeout-graceful-shutdown", "3600",
+              "--timeout-keep-alive", "75",
+              "--reload"]
+    ports:
+      - "${LANGGRAPH_LOCAL_PORT}:8000"
+    volumes:
+      - .:/deps/offermind
+      # Keep the container's uv-managed `.venv` isolated from the host. Without
+      # this, `uv run` inside the container creates `/deps/offermind/backend/.venv`
+      # which leaks through the bind mount to the host with container-style paths
+      # hardcoded — making the venv unusable from macOS and clobbering any host
+      # venv. Same pattern as frontend `node_modules` above. (The image's own
+      # venv lives at /opt/venv, outside the mount.)
+      - /deps/offermind/backend/.venv
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      core-server:
+        condition: service_healthy
+      object-store:
+        condition: service_healthy
+      object-store-init:
+        condition: service_completed_successfully
+    environment:
+      REDIS_URI: redis://redis:6379
+      # In-network S3 endpoint (overrides the host-side value in .env).
+      OBJECT_STORE_ENDPOINT: http://object-store:8333
+      # In-network analytics endpoints for the analytics agent. `.env` only
+      # carries host-published ports (CLICKHOUSE_HTTP_LOCAL_PORT etc.), which
+      # don't resolve from inside the network.
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "8123"
+      CUBE_API_URL: http://cube:4000
+      DBT_DOCS_URL: http://dbt-docs:8080
+      # Mounts the artifact files API (backend/agents/files_api.py) into the
+      # agent server — the vendored server's designed custom-app hook.
+      # enable_custom_route_auth puts the mounted routes behind the server's
+      # auth middleware: a no-op under noop auth, required in multi-user mode.
+      LANGGRAPH_HTTP: >-
+        {"app": "/deps/offermind/backend/agents/files_api.py:app",
+         "enable_custom_route_auth": true}
+      # Multi-user auth verification targets (used only when LANGGRAPH_AUTH is
+      # set in .env; harmless otherwise). In-network JWKS URL — the backend
+      # verifies bearer JWTs minted by the frontend's Better Auth.
+      AUTH_JWKS_URL: http://frontend:3000/api/auth/jwks
+      AUTH_JWT_ISSUER: http://localhost:${FRONTEND_LOCAL_PORT}
+      AUTH_JWT_AUDIENCE: http://localhost:${FRONTEND_LOCAL_PORT}
+      POSTGRES_URI: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      # Selects the postgres backend in the runtime edition router
+      # (hard-required — the router raises if unset).
+      LANGGRAPH_RUNTIME_EDITION: postgres
+      LSD_GRPC_SERVER_ADDRESS: core-server:50052
+      # Repo-owned migrations, applied at boot under a Redis lock (the code
+      # default is the official image's /storage/migrations).
+      MIGRATIONS_PATH: /deps/offermind/backend/storage/migrations
+      LANGSERVE_GRAPHS: >-
+        {
+          "career_agent": "/deps/offermind/backend/agents/career_agent/agents.py:career_agent",
+          "analytics_agent": "/deps/offermind/backend/agents/analytics_agent/agents.py:analytics_agent"
+        }
+    env_file: .env
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/ok', timeout=5).status==200 else 1)",
+        ]
+      interval: 60s
+      timeout: 5s
+      retries: 5
+      # First boot budget: migrations no-op + up to 60s waiting on core-server
+      # gRPC readiness.
+      start_period: 60s
+      start_interval: 2s
+
+  # ============================ Analytics stack ============================
+  # ClickHouse + Dagster + Cube + Superset (docs/ideas/analytics-platform-plan.html
+  # Phase 0). Strictly additive: nothing below gates the app services above.
+  # Pipeline/model code lives in analytics/ (see analytics/CLAUDE.md).
+
+  # Columnar warehouse for product analytics: dlt lands bronze (raw_app___*/
+  # raw_auth___* tables), dbt builds offermind_staging/offermind_marts. Single
+  # node, dev-tuned: config.d caps memory well under the container limit and
+  # disables the cluster-observability system logs; users.d adds a per-query
+  # memory guard. Data survives `compose down` in clickhouse-data.
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.3
+    ports:
+      - "${CLICKHOUSE_HTTP_LOCAL_PORT}:8123" # HTTP API (+ /play query UI)
+      - "${CLICKHOUSE_NATIVE_LOCAL_PORT}:9000" # native TCP (clickhouse-client, dlt loads)
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      # Read-only identity for the analytics agent, referenced by
+      # users.d/analytics-agent.xml via `from_env`. Always defined (an
+      # undefined variable fails ClickHouse's config load, not just the user).
+      CLICKHOUSE_AGENT_PASSWORD: ${CLICKHOUSE_AGENT_PASSWORD:-}
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./analytics/clickhouse/config.d/low-memory.xml:/etc/clickhouse-server/config.d/low-memory.xml:ro
+      - ./analytics/clickhouse/users.d/query-limits.xml:/etc/clickhouse-server/users.d/query-limits.xml:ro
+      - ./analytics/clickhouse/users.d/analytics-agent.xml:/etc/clickhouse-server/users.d/analytics-agent.xml:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    mem_limit: 2g
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "clickhouse-client --user \"$$CLICKHOUSE_USER\" --password \"$$CLICKHOUSE_PASSWORD\" --query 'SELECT 1'",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+  # One-shot Postgres bootstrap for the analytics stack. backend/init.sql only
+  # runs on a FRESH pg volume, so the extra databases/roles are created
+  # idempotently here on every `up`: the `dagster` DB (run/event/schedule
+  # storage), the `superset` DB (BI metadata), and the read-only analytics_ro
+  # role the dlt extraction connects through (SELECT on all current and future
+  # public tables — never write access to the operational schema).
+  analytics-db-init:
+    image: pgvector/pgvector:pg18
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        set -e;
+        psql -tAc "SELECT 1 FROM pg_database WHERE datname='dagster'" | grep -q 1 ||
+        psql -c "CREATE DATABASE dagster";
+        psql -tAc "SELECT 1 FROM pg_database WHERE datname='superset'" | grep -q 1 ||
+        psql -c "CREATE DATABASE superset";
+        psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='analytics_ro'" | grep -q 1 ||
+        psql -c "CREATE ROLE analytics_ro LOGIN";
+        psql -c "ALTER ROLE analytics_ro WITH LOGIN PASSWORD '${ANALYTICS_RO_PASSWORD}'";
+        psql -c "GRANT CONNECT ON DATABASE \"${POSTGRES_DB}\" TO analytics_ro";
+        psql -c "GRANT USAGE ON SCHEMA public TO analytics_ro";
+        psql -c "GRANT SELECT ON ALL TABLES IN SCHEMA public TO analytics_ro";
+        psql -c "ALTER DEFAULT PRIVILEGES FOR ROLE \"${POSTGRES_USER}\" IN SCHEMA public GRANT SELECT ON TABLES TO analytics_ro"
+
+  # Dagster UI + GraphQL (the orchestrator's front door). Parses the dbt
+  # project into a container-local manifest first (each container owns its
+  # copy — no shared-write race through the bind mount), then serves the
+  # offermind_analytics code location. No hot reload: after editing analytics
+  # code, `docker compose restart dagster-webserver dagster-daemon`.
+  dagster-webserver:
+    build:
+      context: ./analytics
+      dockerfile: Dockerfile
+    image: offermind-analytics:local
+    restart: on-failure
+    command:
+      [
+        "sh",
+        "-c",
+        "dbt parse --project-dir /deps/offermind/analytics/dbt --profiles-dir /deps/offermind/analytics/dbt --target-path /tmp/dbt-target && exec dagster-webserver -h 0.0.0.0 -p 3000 -w /deps/offermind/analytics/dagster/workspace.yaml",
+      ]
+    ports:
+      - "${DAGSTER_LOCAL_PORT}:3000"
+    volumes:
+      - .:/deps/offermind
+      # Same isolation pattern as backend .venv / frontend node_modules.
+      - /deps/offermind/analytics/.venv
+      - dagster-home-data:/opt/dagster/home
+      - ./analytics/dagster/dagster.yaml:/opt/dagster/home/dagster.yaml:ro
+    environment:
+      DAGSTER_HOME: /opt/dagster/home
+      DAGSTER_PG_USERNAME: ${POSTGRES_USER}
+      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD}
+      DAGSTER_PG_HOST: postgres
+      DAGSTER_PG_DB: dagster
+      DBT_MANIFEST_PATH: /tmp/dbt-target/manifest.json
+      # dlt source: the read-only role from analytics-db-init.
+      ANALYTICS_SOURCE_PG_URI: postgresql+psycopg2://analytics_ro:${ANALYTICS_RO_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      # dlt destination (native protocol for loads, HTTP for staging).
+      DESTINATION__CLICKHOUSE__CREDENTIALS__HOST: clickhouse
+      DESTINATION__CLICKHOUSE__CREDENTIALS__PORT: "9000"
+      DESTINATION__CLICKHOUSE__CREDENTIALS__HTTP_PORT: "8123"
+      DESTINATION__CLICKHOUSE__CREDENTIALS__USERNAME: ${CLICKHOUSE_USER}
+      DESTINATION__CLICKHOUSE__CREDENTIALS__PASSWORD: ${CLICKHOUSE_PASSWORD}
+      DESTINATION__CLICKHOUSE__CREDENTIALS__DATABASE: ${CLICKHOUSE_DB}
+      DESTINATION__CLICKHOUSE__CREDENTIALS__SECURE: "0"
+      # dbt profile (analytics/dbt/profiles.yml reads these).
+      ANALYTICS_CH_HOST: clickhouse
+      ANALYTICS_CH_PORT: "8123"
+      ANALYTICS_CH_USER: ${CLICKHOUSE_USER}
+      ANALYTICS_CH_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      ANALYTICS_CH_DATABASE: ${CLICKHOUSE_DB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      analytics-db-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/server_info > /dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
+      start_interval: 2s
+
+  # Dagster daemon: ticks the hourly analytics schedule and launches runs.
+  # Same image/env/volumes as the webserver, different command.
+  dagster-daemon:
+    build:
+      context: ./analytics
+      dockerfile: Dockerfile
+    image: offermind-analytics:local
+    restart: on-failure
+    command:
+      [
+        "sh",
+        "-c",
+        "dbt parse --project-dir /deps/offermind/analytics/dbt --profiles-dir /deps/offermind/analytics/dbt --target-path /tmp/dbt-target && exec dagster-daemon run -w /deps/offermind/analytics/dagster/workspace.yaml",
+      ]
+    volumes:
+      - .:/deps/offermind
+      - /deps/offermind/analytics/.venv
+      - dagster-home-data:/opt/dagster/home
+      - ./analytics/dagster/dagster.yaml:/opt/dagster/home/dagster.yaml:ro
+    environment:
+      DAGSTER_HOME: /opt/dagster/home
+      DAGSTER_PG_USERNAME: ${POSTGRES_USER}
+      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD}
+      DAGSTER_PG_HOST: postgres
+      DAGSTER_PG_DB: dagster
+      DBT_MANIFEST_PATH: /tmp/dbt-target/manifest.json
+      ANALYTICS_SOURCE_PG_URI: postgresql+psycopg2://analytics_ro:${ANALYTICS_RO_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DESTINATION__CLICKHOUSE__CREDENTIALS__HOST: clickhouse
+      DESTINATION__CLICKHOUSE__CREDENTIALS__PORT: "9000"
+      DESTINATION__CLICKHOUSE__CREDENTIALS__HTTP_PORT: "8123"
+      DESTINATION__CLICKHOUSE__CREDENTIALS__USERNAME: ${CLICKHOUSE_USER}
+      DESTINATION__CLICKHOUSE__CREDENTIALS__PASSWORD: ${CLICKHOUSE_PASSWORD}
+      DESTINATION__CLICKHOUSE__CREDENTIALS__DATABASE: ${CLICKHOUSE_DB}
+      DESTINATION__CLICKHOUSE__CREDENTIALS__SECURE: "0"
+      ANALYTICS_CH_HOST: clickhouse
+      ANALYTICS_CH_PORT: "8123"
+      ANALYTICS_CH_USER: ${CLICKHOUSE_USER}
+      ANALYTICS_CH_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      ANALYTICS_CH_DATABASE: ${CLICKHOUSE_DB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      analytics-db-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "dagster-daemon", "liveness-check"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+      start_interval: 2s
+
+  # dbt docs site (model/column catalog, compiled SQL, tests, lineage). Same
+  # image as Dagster; regenerates the catalog against the warehouse at boot,
+  # so refresh after model edits with `docker compose restart dbt-docs`. Served
+  # from a container-local target dir (nothing written into the bind mount).
+  # dbt-clickhouse leaves `database` blank (ClickHouse has one level), which
+  # empties the docs' Database tab — dbt_docs_patch labels the artifacts first.
+  dbt-docs:
+    build:
+      context: ./analytics
+      dockerfile: Dockerfile
+    image: offermind-analytics:local
+    restart: on-failure
+    command:
+      [
+        "sh",
+        "-c",
+        "dbt docs generate --project-dir /deps/offermind/analytics/dbt --profiles-dir /deps/offermind/analytics/dbt --target-path /tmp/dbt-target && python -m offermind_analytics.dbt_docs_patch /tmp/dbt-target && exec dbt docs serve --project-dir /deps/offermind/analytics/dbt --profiles-dir /deps/offermind/analytics/dbt --target-path /tmp/dbt-target --host 0.0.0.0 --port 8080 --no-browser",
+      ]
+    ports:
+      - "${DBT_DOCS_LOCAL_PORT}:8080"
+    volumes:
+      - .:/deps/offermind
+      - /deps/offermind/analytics/.venv
+    environment:
+      ANALYTICS_CH_HOST: clickhouse
+      ANALYTICS_CH_PORT: "8123"
+      ANALYTICS_CH_USER: ${CLICKHOUSE_USER}
+      ANALYTICS_CH_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      ANALYTICS_CH_DATABASE: ${CLICKHOUSE_DB}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/index.html > /dev/null"]
+      interval: 60s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+      start_interval: 2s
+
+  # Cube semantic layer over the gold marts — metric definitions with
+  # descriptions (the future analytics agent's vocabulary via /v1/meta), plus
+  # a Postgres-wire SQL API for BI/SQL Lab. Dev mode embeds Cube Store (no
+  # extra container) and enables the Playground UI; production hardening
+  # (JWT security context, queryRewrite) is a later phase.
+  cube:
+    image: cubejs/cube:v1.7.31
+    restart: on-failure
+    ports:
+      - "${CUBE_LOCAL_PORT}:4000" # REST API + Playground
+      - "${CUBE_SQL_LOCAL_PORT}:15432" # Postgres-wire SQL API
+    environment:
+      CUBEJS_DEV_MODE: "true"
+      CUBEJS_API_SECRET: ${CUBE_API_SECRET}
+      CUBEJS_DB_TYPE: clickhouse
+      CUBEJS_DB_HOST: clickhouse
+      CUBEJS_DB_PORT: "8123"
+      CUBEJS_DB_NAME: ${CLICKHOUSE_DB}_marts # the dbt marts database
+      CUBEJS_DB_USER: ${CLICKHOUSE_USER}
+      CUBEJS_DB_PASS: ${CLICKHOUSE_PASSWORD}
+      CUBEJS_DB_CLICKHOUSE_READONLY: "true"
+      CUBEJS_PG_SQL_PORT: "15432"
+      CUBEJS_SQL_USER: ${CUBE_SQL_USER}
+      CUBEJS_SQL_PASSWORD: ${CUBE_SQL_PASSWORD}
+    volumes:
+      - ./analytics/cube/model:/cube/conf/model
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://localhost:4000/readyz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\"",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+      start_interval: 2s
+
+  # One-shot Superset bootstrap: migrate the metadata DB, ensure the admin
+  # user, and import the committed "OfferMind Overview" dashboard bundle
+  # (connection passwords sed-ed in from env, zipped with stdlib). The import
+  # is UUID-keyed, so re-running updates in place; the bundle guard keeps the
+  # init green while the bundle is being (re)authored.
+  superset-init:
+    build:
+      context: ./analytics/superset
+      dockerfile: Dockerfile
+    image: offermind-superset:local
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      analytics-db-init:
+        condition: service_completed_successfully
+    environment:
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      SUPERSET_META_DB_URI: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/superset
+      SUPERSET_REDIS_BROKER: redis://redis:6379/2
+      SUPERSET_REDIS_RESULTS: redis://redis:6379/3
+      SUPERSET_REDIS_CACHE: redis://redis:6379/4
+      SUPERSET_ADMIN_USERNAME: ${SUPERSET_ADMIN_USERNAME}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD}
+      # For the bundle's __CLICKHOUSE_URI__/__CUBE_URI__ placeholders.
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      CUBE_SQL_USER: ${CUBE_SQL_USER}
+      CUBE_SQL_PASSWORD: ${CUBE_SQL_PASSWORD}
+    volumes:
+      - ./analytics/superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - ./analytics/superset/import_assets.py:/app/import_assets.py:ro
+      - ./analytics/superset/assets:/bootstrap:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        set -e;
+        superset db upgrade;
+        (superset fab create-admin
+        --username "$$SUPERSET_ADMIN_USERNAME"
+        --firstname OfferMind --lastname Admin
+        --email admin@offermind.local
+        --password "$$SUPERSET_ADMIN_PASSWORD" || true);
+        superset init;
+        if [ -d /bootstrap/dashboard_export ]; then
+        rm -rf /tmp/bundle /tmp/bundle.zip &&
+        cp -r /bootstrap/dashboard_export /tmp/bundle &&
+        sed -i "s|__CLICKHOUSE_URI__|clickhousedb://$$CLICKHOUSE_USER:$$CLICKHOUSE_PASSWORD@clickhouse:8123/$${CLICKHOUSE_DB}_marts|" /tmp/bundle/databases/*.yaml &&
+        sed -i "s|__CUBE_URI__|postgresql+psycopg2://$$CUBE_SQL_USER:$$CUBE_SQL_PASSWORD@cube:15432/cube|" /tmp/bundle/databases/*.yaml &&
+        (cd /tmp && python -m zipfile -c bundle.zip bundle/) &&
+        python /app/import_assets.py /tmp/bundle.zip "$$SUPERSET_ADMIN_USERNAME";
+        else echo "no dashboard bundle to import"; fi
+
+  # Superset web app — the BI front door. Metadata in the shared Postgres
+  # (database `superset`), caches + Celery broker on the shared Redis (DB
+  # numbers /2 /3 /4). Login with SUPERSET_ADMIN_USERNAME/PASSWORD from .env.
+  superset:
+    build:
+      context: ./analytics/superset
+      dockerfile: Dockerfile
+    image: offermind-superset:local
+    restart: on-failure
+    ports:
+      - "${SUPERSET_LOCAL_PORT}:8088"
+    environment:
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      SUPERSET_META_DB_URI: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/superset
+      SUPERSET_REDIS_BROKER: redis://redis:6379/2
+      SUPERSET_REDIS_RESULTS: redis://redis:6379/3
+      SUPERSET_REDIS_CACHE: redis://redis:6379/4
+    volumes:
+      - ./analytics/superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - superset-home-data:/app/superset_home
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      superset-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8088/health > /dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+      start_interval: 2s
+
+  # Superset Celery worker: async queries, alerts, thumbnails. Same image and
+  # config as the web app. The image's default healthcheck probes the web
+  # port, so the worker overrides it with a celery ping.
+  superset-worker:
+    build:
+      context: ./analytics/superset
+      dockerfile: Dockerfile
+    image: offermind-superset:local
+    restart: on-failure
+    command:
+      [
+        "celery",
+        "--app=superset.tasks.celery_app:app",
+        "worker",
+        "--pool=prefork",
+        "-c",
+        "2",
+      ]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "celery --app=superset.tasks.celery_app:app inspect ping -d celery@$$HOSTNAME",
+        ]
+      interval: 60s
+      timeout: 20s
+      retries: 5
+      start_period: 60s
+    environment:
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      SUPERSET_META_DB_URI: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/superset
+      SUPERSET_REDIS_BROKER: redis://redis:6379/2
+      SUPERSET_REDIS_RESULTS: redis://redis:6379/3
+      SUPERSET_REDIS_CACHE: redis://redis:6379/4
+    volumes:
+      - ./analytics/superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - superset-home-data:/app/superset_home
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      superset-init:
+        condition: service_completed_successfully

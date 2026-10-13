@@ -1,0 +1,469 @@
+"use client";
+
+import React, { useEffect, useMemo } from "react";
+import {
+  useMessages,
+  useToolCalls,
+  type AnyStream,
+  type SubagentDiscoverySnapshot,
+} from "@langchain/react";
+import { type AIMessageChunk, isAIMessage } from "@langchain/core/messages";
+import {
+  AlertCircle,
+  Bot,
+  CheckCircle2,
+  ChevronDown,
+  Clock3,
+  Loader2,
+  MessagesSquare,
+  Radar,
+  Scissors,
+  StopCircle,
+  type LucideIcon,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Collapse } from "@/app/components/Collapse";
+import { ToolCallBatchList } from "@/app/components/ToolCallBatchList";
+import { ToolCallBox } from "@/app/components/ToolCallBox";
+import { MarkdownContent } from "@/app/components/MarkdownContent";
+import { useAutoCollapse } from "@/app/hooks/useAutoCollapse";
+import { approvalQueueNote, type ApprovalsBundle } from "@/app/hooks/useInterruptApprovals";
+import { usePointerToggle } from "@/app/hooks/usePointerToggle";
+import type { PendingApproval, SubAgent, ToolCall } from "@/app/types/types";
+import {
+  extractSubAgentContent,
+  formatDuration,
+  parsePartialArgs,
+  toResultString,
+  unwrapToolPayload,
+} from "@/app/utils/utils";
+import { cn } from "@/lib/utils";
+
+function mapSnapshotStatus(status: SubagentDiscoverySnapshot["status"]): SubAgent["status"] {
+  if (status === "running") return "active";
+  if (status === "error") return "error";
+  return "completed";
+}
+
+// Identity glyph per known subagent; anything undeclared keeps the robot.
+const SUBAGENT_ICON_MAP: Record<string, LucideIcon> = {
+  "hiring-recon": Radar,
+  "resume-tailor": Scissors,
+  "interview-coach": MessagesSquare,
+};
+
+const SUBAGENT_LABELS: Record<string, string> = {
+  "hiring-recon": "公司调研",
+  "resume-tailor": "简历优化",
+  "interview-coach": "面试教练",
+};
+
+function subagentLabel(name: string): string {
+  return SUBAGENT_LABELS[name] ?? name;
+}
+
+function getSubAgentStatusMeta(status: SubAgent["status"]) {
+  switch (status) {
+    case "active":
+      return {
+        label: "运行中",
+        icon: Loader2,
+        className: "border-primary/25 bg-primary/10 text-primary",
+        iconClassName: "animate-spin",
+      };
+    case "completed":
+      return {
+        label: "已完成",
+        icon: CheckCircle2,
+        className: "border-success/25 bg-success/10 text-success",
+        iconClassName: "",
+      };
+    case "error":
+      return {
+        label: "失败",
+        icon: AlertCircle,
+        className: "border-destructive/30 bg-destructive/10 text-destructive",
+        iconClassName: "",
+      };
+    default:
+      return {
+        label: "排队中",
+        icon: Clock3,
+        className: "border-muted bg-muted/60 text-muted-foreground",
+        iconClassName: "",
+      };
+  }
+}
+
+const noop = () => {};
+
+interface SubagentHeaderProps {
+  name: string;
+  status: SubAgent["status"];
+  /** A nested tool call is awaiting HITL review — show that over the status. */
+  needsReview?: boolean;
+  toolCount?: number;
+  durationLabel?: string | null;
+  isExpanded?: boolean;
+  onToggle?: () => void;
+}
+
+/**
+ * The always-visible header row of a subagent card: identity chip + status
+ * badge + tool-count pill + duration, and (when the card has a body) the
+ * collapse toggle. Also serves the queued state, so the queued → running
+ * transition doesn't jump.
+ */
+function SubagentHeader({
+  name,
+  status,
+  needsReview,
+  toolCount,
+  durationLabel,
+  isExpanded,
+  onToggle,
+}: SubagentHeaderProps) {
+  // The run pauses (terminal lifecycle) while an approval is pending, which
+  // would read as "Failed" — the review badge tells the real story.
+  const statusMeta = needsReview
+    ? {
+        label: "待审核",
+        icon: StopCircle,
+        className: "border-warning/25 bg-warning/10 text-warning",
+        iconClassName: "",
+      }
+    : getSubAgentStatusMeta(status);
+  const StatusIcon = statusMeta.icon;
+  const AgentIcon = SUBAGENT_ICON_MAP[name] ?? Bot;
+  const { onPointerDown, onClick } = usePointerToggle(onToggle ?? noop);
+
+  const content = (
+    <>
+      <div className="flex min-w-0 flex-1 items-center gap-3">
+        <span className="flex size-8 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
+          <AgentIcon size={16} />
+        </span>
+        <span className="min-w-0 truncate font-sans text-[15px] leading-[140%] font-bold tracking-[-0.4px] text-foreground">
+          {subagentLabel(name)}
+        </span>
+        <span
+          className={cn(
+            "inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium",
+            statusMeta.className
+          )}
+        >
+          <StatusIcon size={12} className={statusMeta.iconClassName} />
+          {statusMeta.label}
+        </span>
+        {toolCount != null && toolCount > 0 && (
+          <span className="inline-flex h-5 shrink-0 items-center rounded-full bg-surface3 px-2 text-[11px] font-semibold text-secondary">
+            {toolCount} 个工具
+          </span>
+        )}
+        {durationLabel && <span className="shrink-0 text-xs text-tertiary">{durationLabel}</span>}
+      </div>
+      {onToggle && (
+        <ChevronDown
+          size={14}
+          className={cn(
+            "shrink-0 text-muted-foreground transition-transform duration-200",
+            !isExpanded && "-rotate-90"
+          )}
+        />
+      )}
+    </>
+  );
+
+  return (
+    <div className={cn("relative overflow-hidden", status === "active" && "tool-running-sweep")}>
+      {onToggle ? (
+        <Button
+          variant="ghost"
+          size="sm"
+          onPointerDown={onPointerDown}
+          onClick={onClick}
+          aria-expanded={isExpanded}
+          className="relative z-10 flex h-auto w-full items-center justify-between gap-3 border-none px-3 py-3 text-left shadow-none outline-hidden transition-colors duration-200 hover:bg-transparent"
+        >
+          {content}
+        </Button>
+      ) : (
+        <div className="relative z-10 flex w-full items-center justify-between gap-3 px-3 py-3">
+          {content}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const cardClassName =
+  "w-full overflow-hidden rounded-2xl border border-border bg-surface-raised shadow-xs";
+
+/**
+ * Placeholder card for a `task` call whose discovery snapshot hasn't landed
+ * yet (args still streaming). Hook-free on purpose: the scoped selector hooks
+ * treat an undefined target as the ROOT namespace, so they must not be called
+ * before a snapshot exists.
+ */
+export function QueuedSubagentCard({ name }: { name: string }) {
+  return (
+    <div className={cardClassName}>
+      <SubagentHeader name={name} status="pending" />
+    </div>
+  );
+}
+
+interface SubagentCardProps {
+  stream: AnyStream;
+  snapshot: SubagentDiscoverySnapshot;
+  taskToolCall: ToolCall;
+  isLoading?: boolean;
+  /** HITL approval state from useInterruptApprovals (owned by ChatInterface). */
+  approvals?: ApprovalsBundle;
+}
+
+/**
+ * One subagent as a single disclosure card: an always-visible header row over
+ * a collapsible INPUT / ACTIVITY / OUTPUT body. Expanded while the subagent
+ * runs, auto-collapsed to the header the moment it completes.
+ *
+ * Mounting subscribes to the subagent's namespaced projections (ref-counted;
+ * shared with any other consumer):
+ *
+ *  - `tools` — authoritative call lifecycle (`tool-started/finished/error`)
+ *    with parsed args and outputs. No arg deltas on this channel.
+ *  - `messages` — the subagent's own LLM stream; a call whose args are
+ *    still streaming exists only as `tool_call_chunks` here, so this is
+ *    what makes nested tool args grow token-by-token live.
+ */
+export const SubagentCard = React.memo<SubagentCardProps>(
+  ({ stream, snapshot, taskToolCall, isLoading, approvals }) => {
+    const assembled = useToolCalls(stream, snapshot);
+    const messages = useMessages(stream, snapshot);
+
+    // snapshot.status is the authority (trailing namespaced events after
+    // `complete` can't hold the card open); the isLoading gate makes a
+    // stopped run read as terminal even if its snapshot is stuck "running".
+    const isRunning = snapshot.status === "running" && !!isLoading;
+
+    const nestedBatches: ToolCall[][] = useMemo(() => {
+      // Authoritative status/result per call from the tools channel.
+      const fromTools = new Map<string, ToolCall>();
+      for (const tc of assembled) {
+        if (tc.name === "task") continue;
+        fromTools.set(tc.id, {
+          id: tc.id,
+          name: tc.name,
+          args: (tc.args ?? {}) as Record<string, unknown>,
+          result: toResultString(unwrapToolPayload(tc.output)),
+          status:
+            tc.status === "error" ? "error" : tc.status === "finished" ? "completed" : "pending",
+        });
+      }
+      // Batch by issuing AI message — calls in one message ran in parallel.
+      // A call whose args are still streaming exists only as a
+      // tool_call_chunk until it finishes assembling.
+      const batches: ToolCall[][] = [];
+      const seen = new Set<string>();
+      for (const message of messages) {
+        if (!isAIMessage(message)) continue;
+        const batch: ToolCall[] = [];
+        for (const tc of message.tool_calls ?? []) {
+          if (!tc.id || !tc.name || tc.name === "task" || seen.has(tc.id)) continue;
+          seen.add(tc.id);
+          batch.push(
+            fromTools.get(tc.id) ?? {
+              id: tc.id,
+              name: tc.name,
+              args: (tc.args ?? {}) as Record<string, unknown>,
+              status: "pending",
+            }
+          );
+        }
+        for (const chunk of (message as AIMessageChunk).tool_call_chunks ?? []) {
+          if (!chunk.id || !chunk.name || chunk.name === "task" || seen.has(chunk.id)) continue;
+          seen.add(chunk.id);
+          batch.push({
+            id: chunk.id,
+            name: chunk.name,
+            args: parsePartialArgs(chunk.args),
+            status: "pending",
+          });
+        }
+        if (batch.length > 0) batches.push(batch);
+      }
+      // Tools-channel calls absent from the replayed messages (message deltas
+      // are live-only in the durable event log) keep their order as single
+      // steps, so older threads degrade to the flat list.
+      for (const [id, tc] of fromTools) {
+        if (!seen.has(id)) batches.push([tc]);
+      }
+      return batches;
+    }, [assembled, messages]);
+
+    // Match unassigned approvals (execute interrupts raised INSIDE this
+    // subagent — HITL fires before the tool starts, so the call exists only
+    // on the messages channel, still `pending`) to nested calls: args
+    // equality first, then name. Two parallel subagents with an identical
+    // unresolved same-name+args call are genuinely ambiguous — both cards
+    // would claim it; deciding on either resumes the interrupt and the stale
+    // claim prunes itself.
+    const approvalByNestedId = useMemo(() => {
+      const map = new Map<string, PendingApproval>();
+      const unassigned = approvals?.unassignedApprovals ?? [];
+      if (unassigned.length === 0) return map;
+      const openCalls = nestedBatches.flat().filter((tc) => tc.status === "pending");
+      const claimed = new Set<string>();
+      for (const approval of unassigned) {
+        const wantedArgs = JSON.stringify(approval.actionRequest.args ?? {});
+        const byArgs = openCalls.find(
+          (tc) =>
+            !claimed.has(tc.id) &&
+            tc.name === approval.actionRequest.name &&
+            JSON.stringify(tc.args ?? {}) === wantedArgs
+        );
+        const match =
+          byArgs ??
+          openCalls.find((tc) => !claimed.has(tc.id) && tc.name === approval.actionRequest.name);
+        if (match) {
+          claimed.add(match.id);
+          map.set(match.id, approval);
+        }
+      }
+      return map;
+    }, [approvals?.unassignedApprovals, nestedBatches]);
+
+    const hasNestedApproval = approvalByNestedId.size > 0;
+    // Pin the card open while a nested approval is pending — the run goes
+    // idle on interrupt, which would otherwise auto-collapse the card and
+    // hide the approval UI that unblocks it.
+    const { isExpanded, toggle } = useAutoCollapse(isRunning, {
+      forceExpanded: hasNestedApproval,
+    });
+
+    // Report claimed approval keys upward so ChatInterface's fallback block
+    // doesn't render duplicates. Compare-before-set lives in the registry.
+    const registerClaims = approvals?.registerSubagentClaims;
+    const claimedKeysJoined = useMemo(
+      () =>
+        Array.from(approvalByNestedId.values())
+          .map((approval) => approval.key)
+          .sort()
+          .join(","),
+      [approvalByNestedId]
+    );
+    useEffect(() => {
+      if (!registerClaims) return;
+      registerClaims(snapshot.id, claimedKeysJoined ? claimedKeysJoined.split(",") : []);
+      return () => registerClaims(snapshot.id, []);
+    }, [registerClaims, snapshot.id, claimedKeysJoined]);
+
+    const decide = approvals?.decide;
+    const queuedDecisions = approvals?.queuedDecisions;
+    // Once the subagent's task has returned, nothing nested can still be
+    // running — but calls that only ever existed on the messages channel
+    // (HITL-gated ones get no tools-channel events, and a resumed run's
+    // events don't reach an already-mounted projection) would keep their
+    // `pending` spinner forever. Render-time coercion only; a refresh
+    // rehydrates the real results from the checkpoint.
+    const snapshotTerminal = snapshot.status === "complete" || snapshot.status === "error";
+    const renderNestedToolCall = (toolCall: ToolCall) => {
+      const approval = approvalByNestedId.get(toolCall.id);
+      if (!approval || !decide) {
+        const shown =
+          snapshotTerminal && toolCall.status === "pending"
+            ? { ...toolCall, status: "completed" as const }
+            : toolCall;
+        return <ToolCallBox key={toolCall.id} toolCall={shown} />;
+      }
+      return (
+        <ToolCallBox
+          key={toolCall.id}
+          toolCall={{ ...toolCall, status: "interrupted" }}
+          approval={approval}
+          queuedDecision={queuedDecisions?.get(approval.key)}
+          queueNote={queuedDecisions ? approvalQueueNote(approval, queuedDecisions) : undefined}
+          onDecide={decide}
+        />
+      );
+    };
+
+    const nestedToolCallCount = useMemo(
+      () => nestedBatches.reduce((count, batch) => count + batch.length, 0),
+      [nestedBatches]
+    );
+
+    const subAgent: SubAgent = useMemo(
+      () => ({
+        id: snapshot.id,
+        name: taskToolCall.name,
+        subAgentName: snapshot.name,
+        input: taskToolCall.args,
+        output:
+          snapshot.output != null
+            ? { result: toResultString(unwrapToolPayload(snapshot.output)) ?? "" }
+            : taskToolCall.result
+              ? { result: taskToolCall.result }
+              : undefined,
+        status: mapSnapshotStatus(snapshot.status),
+      }),
+      [snapshot, taskToolCall]
+    );
+
+    // Sub-second spans are noise, and history-reseeded snapshots carry
+    // near-equal hydration timestamps — suppress rather than show "<1s".
+    const durationLabel =
+      snapshot.completedAt && snapshot.completedAt.getTime() - snapshot.startedAt.getTime() >= 1000
+        ? formatDuration(snapshot.startedAt, snapshot.completedAt)
+        : null;
+
+    return (
+      <div className={cardClassName}>
+        <SubagentHeader
+          name={subAgent.subAgentName}
+          status={subAgent.status}
+          needsReview={hasNestedApproval}
+          toolCount={nestedToolCallCount}
+          durationLabel={durationLabel}
+          isExpanded={isExpanded}
+          onToggle={toggle}
+        />
+        <Collapse isExpanded={isExpanded}>
+          <div className="border-t border-border px-4 py-4">
+            <h4 className="mb-2 text-xs font-semibold tracking-wider text-muted-foreground uppercase">
+              输入
+            </h4>
+            <div className="mb-4 rounded-xl border border-border bg-background/50 p-3">
+              <MarkdownContent content={extractSubAgentContent(subAgent.input)} />
+            </div>
+            {nestedBatches.length > 0 && (
+              <>
+                <h4 className="mb-2 text-xs font-semibold tracking-wider text-muted-foreground uppercase">
+                  活动
+                </h4>
+                <div className="relative mb-4 before:absolute before:top-2 before:bottom-2 before:left-[12px] before:w-px before:bg-border2">
+                  <ToolCallBatchList
+                    batches={nestedBatches}
+                    renderToolCall={renderNestedToolCall}
+                  />
+                </div>
+              </>
+            )}
+            {subAgent.output && (
+              <>
+                <h4 className="mb-2 text-xs font-semibold tracking-wider text-muted-foreground uppercase">
+                  输出
+                </h4>
+                <div className="rounded-xl border border-border bg-background/50 p-3">
+                  <MarkdownContent content={extractSubAgentContent(subAgent.output)} />
+                </div>
+              </>
+            )}
+          </div>
+        </Collapse>
+      </div>
+    );
+  }
+);
+
+SubagentCard.displayName = "SubagentCard";

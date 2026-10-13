@@ -1,0 +1,9 @@
+.venv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local experiments
+local_experiments/

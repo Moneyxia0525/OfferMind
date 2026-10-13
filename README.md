@@ -1,0 +1,389 @@
+<div align="center">
+
+<a href="https://github.com/Moneyxia0525/OfferMind" target="_blank">
+  <picture>
+    <img alt="OfferMind" src="docs/images/offermind-logo-transparent.png" width="180" height="180">
+  </picture>
+</a>
+
+# OfferMind 🚀
+
+### ✨ GenAI-Accelerated Career Advancement ✨
+
+**Upload your CV + a job description. Get a tailored resume PDF, a researched interview-prep doc, and a day-of battlecard cheat sheet — built by a multi-agent system with long-term memory.**
+
+<!-- Row 1 · project -->
+
+![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)
+![Next.js](https://img.shields.io/badge/Next.js-16-000000?logo=nextdotjs&logoColor=white)
+![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)
+[![GitHub stars](https://img.shields.io/github/stars/Moneyxia0525/OfferMind?style=social)](https://github.com/Moneyxia0525/OfferMind/stargazers)
+
+<!-- Row 2 · AI stack -->
+
+![LangChain](https://img.shields.io/badge/LangChain-v1-1C3C3C?logo=langchain&logoColor=white)
+![LangGraph](https://img.shields.io/badge/LangGraph-1.x-FF6F61)
+![DeepAgents](https://img.shields.io/badge/DeepAgents-0.6-6E56CF)
+![LangSmith](https://img.shields.io/badge/Observability-LangSmith-FF6F61)
+![Exposes MCP + A2A](https://img.shields.io/badge/exposes-MCP%20%2B%20A2A-0A7EA4)
+
+<br/>
+
+<img alt="OfferMind start page — chat-driven prep on the left, a live artifact workspace on the right" src="docs/images/offermind-hero-image.png" width="100%">
+
+</div>
+
+---
+
+## What is OfferMind?
+
+Preparing for an interview takes hours of tedious resume tailoring and company research. **OfferMind automates the heavy lifting.** Hand it your current CV and a target Job Description (or just a JD URL) — whether you're applying externally or angling for an internal move — and a team of specialized AI agents researches the company, rewrites your resume to fit, coaches you round-by-round, and prints a cheat sheet for the day of.
+
+- 📄 **Tailored resume → PDF** — your experience rewritten against the exact JD + company research, rendered with [`rendercv`](https://github.com/rendercv/rendercv) (editable & re-renderable).
+- 🔍 **Deep company & role recon** — live web research distilled into a match analysis.
+- 🎯 **Structured interview prep** — a self-introduction plus per-round STAR stories mapped to the role.
+- ⚡ **Day-of battlecard** — a one-page-per-round PDF cheat sheet for the final high-pressure review.
+- 🗓️ **Time-boxed prep plans** — a study plan that fits 1 month, 2 weeks, or just 3 hours.
+- 🔗 **Paste a JD URL** — point it at a careers page; it extracts and processes the posting for you.
+- 💬 **Iterate by chatting** — "add a 4th round", "add React to my skills" — streaming multi-turn edits, with the right agent owning each file.
+- 🗂️ **Built-in workspace** — upload, preview (PDF / MD / YAML / JSON / code), print-to-PDF, and swap the LLM at runtime.
+
+## Demo
+
+<img alt="OfferMind demo — CV + JD in, tailored resume PDF, interview prep, and day-of battlecard out" src="docs/images/offermind-demo.gif" width="100%">
+
+## Quick Start
+
+The whole stack — frontend, backend, Postgres, Redis, S3-compatible object storage, and an analytics stack (ClickHouse, Dagster, Cube, Superset) — runs in Docker.
+
+```bash
+# 1. Clone & configure
+git clone https://github.com/Moneyxia0525/OfferMind.git
+cd OfferMind
+cp .env.example .env          # then fill in your API keys (see table below)
+
+# 2. Launch everything
+docker compose up -d
+
+# 3. Find your host ports (set in .env, vary per machine)
+docker ps                     # read the 0.0.0.0:<host>->... mappings
+
+# 4. Open the app
+#    Frontend UI      →  http://localhost:<FRONTEND_LOCAL_PORT>/
+#    Backend API docs →  http://localhost:<LANGGRAPH_LOCAL_PORT>/docs
+```
+
+> 💡 **Pick your LLM in the app.** Open the in-app **Configuration** dialog to set the main agent and subagent models — no rebuild needed. See **LLM configuration** below for recommended models and free / local options.
+
+<details>
+<summary><b>Environment variables</b> — what to put in <code>.env</code></summary>
+
+<br/>
+
+| Variable | Required | Purpose |
+| --- | :---: | --- |
+| `OPENAI_API_KEY` | ✅ | Default main + subagent models |
+| `TAVILY_API_KEY` | ✅ | Web research (`hiring-recon`) |
+| `LLAMA_CLOUD_API_KEY` | ✅ | Document parsing (LlamaParse) |
+| `POSTGRES_PASSWORD` | ✅ | Local Postgres password |
+| `ANTHROPIC_API_KEY` / `GOOGLE_API_KEY` | ⬜ | Alternative providers (swap at runtime) |
+| `OPENAI_API_BASE` | ⬜ | Self-hosted / Azure / LM Studio endpoint |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_DEFAULT_REGION` | ⬜ | AWS Bedrock models |
+| `LANGCHAIN_API_KEY` + `LANGCHAIN_TRACING_V2=true` | ⬜ | LangSmith tracing (recommended) |
+| `AUTH_ENABLED` / `BETTER_AUTH_SECRET` / `LANGGRAPH_AUTH` | ⬜ | Multi-user auth (opt-in) — steps in [Authentication & multi-user](#authentication--multi-user) |
+| `CAREER_AGENT_EXECUTE_APPROVAL` | preset | Human approval for the agent's shell tool — see below |
+| `SANDBOX_PROVIDER` (+ `SANDBOX_E2B_*`, `SANDBOX_TEMPLATE`) | preset | Where the shell tool executes: host or isolated sandbox — see below |
+| `FRONTEND_LOCAL_PORT` / `LANGGRAPH_LOCAL_PORT` / `POSTGRES_LOCAL_PORT` / `REDIS_LOCAL_PORT` / `OBJECT_STORE_LOCAL_PORT` | preset | Host port mappings |
+| `OBJECT_STORE_*` | preset | Artifact object storage — see below |
+| `CLICKHOUSE_*` / `DAGSTER_*` / `DBT_DOCS_LOCAL_PORT` / `CUBE_*` / `SUPERSET_*` / `ANALYTICS_RO_PASSWORD` | preset | Analytics stack (warehouse, orchestration, semantic layer, BI) — see below |
+| `CLICKHOUSE_AGENT_PASSWORD` / `ANALYTICS_AGENT_ALLOWED_USERS` | generate / empty | The analytics agent's read-only warehouse login, and who may run it — see below |
+
+**Shell-command approval.** Risky `execute` (bash) commands pause in the UI for approve / edit / reject; a conservative read-only allowlist auto-approves trivial pokes. The gate applies in **both** sandbox modes below — isolation contains blast radius, not exfiltration or API misuse. On by default — set `CAREER_AGENT_EXECUTE_APPROVAL=false` only for offline evals or emergency rollback (env changes need `docker compose up -d backend` to recreate, not `restart`). Full policy in [`backend/agents/career_agent/README.md`](backend/agents/career_agent/README.md#human-in-the-loop-execute-approval).
+
+**Sandbox.** `SANDBOX_PROVIDER` picks where `execute` commands (and `rendercv` renders) run. `local` (default) executes on the backend host — right for local dev and a trusted team, zero extra moving parts. `e2b` runs every command in an isolated remote **microVM** over the E2B API: point `SANDBOX_E2B_API_URL` at a self-hosted [CubeSandbox](https://github.com/TencentCloud/CubeSandbox) (open source, Apache-2.0 — your data never leaves your infra; provisioning + template guide in [`deploy/cubesandbox/`](deploy/cubesandbox/README.md)), or leave it empty to use [E2B Cloud](https://e2b.dev) with the same code path. CubeSandbox requires its own Linux host (custom PVM kernel or native KVM), so it is reached over HTTP rather than run inside docker compose.
+
+**Object storage.** Binary artifacts (uploads + rendered PDFs) live in S3-compatible object storage. Locally that's the compose `object-store` service (SeaweedFS) and the presets work as-is: S3 API on `OBJECT_STORE_LOCAL_PORT`, a browsable bucket UI on `OBJECT_STORE_UI_LOCAL_PORT`, and placeholder credentials that the local emulator accepts but doesn't enforce. For the cloud, point `OBJECT_STORE_ENDPOINT` / `OBJECT_STORE_BUCKET` / credentials at a managed bucket — AWS S3, GCS, Azure, or any S3-compatible store — with no code changes. Note: the `AWS_*` variables are reserved for Bedrock models; the object store reads only `OBJECT_STORE_*`.
+
+**Analytics.** A self-contained analytics stack ([`docs/ideas/analytics-platform-plan.html`](docs/ideas/analytics-platform-plan.html) Phase 0) rides the same compose file: dlt extracts the operational Postgres into a ClickHouse warehouse (structure and metrics only — chat/CV text never lands there), dbt models it into star-schema marts, Cube serves the metric definitions, and Superset ships a seeded **OfferMind Overview** dashboard (users, threads & runs, reliability, tokens + estimated cost), all orchestrated by Dagster on an hourly schedule. Fill the three `generate:` secrets in the analytics block of `.env`, then after first boot trigger the initial pipeline run once — `docker compose exec dagster-daemon dagster asset materialize --select "*" -m offermind_analytics.definitions` (or "Materialize all" in the Dagster UI on `DAGSTER_LOCAL_PORT`) — and log into Superset on `SUPERSET_LOCAL_PORT` with `SUPERSET_ADMIN_USERNAME`/`SUPERSET_ADMIN_PASSWORD`. Cube's Playground is on `CUBE_LOCAL_PORT`, the generated dbt docs site (model/column catalog + lineage) on `DBT_DOCS_LOCAL_PORT`, ClickHouse's query UI on `http://localhost:<CLICKHOUSE_HTTP_LOCAL_PORT>/play`. Budget ~2–4 GB extra RAM; overview and screenshots in [`analytics/README.md`](analytics/README.md), developer guide in [`analytics/CLAUDE.md`](analytics/CLAUDE.md). Product analytics (PostHog) and LLM-trace storage (Langfuse) are deliberate follow-ups per the blueprint.
+
+**Analytics agent.** A second agent, picked from the agent switcher in the top bar, answers questions about the product itself — activity, reliability, LLM cost, agent behaviour — by querying the warehouse above and drawing the answer. It reads the marts' own documentation (dbt descriptions, Cube metric definitions, ClickHouse schema) before writing SQL, and charts persist with the conversation, so reopening a thread months later still shows them. It connects as a dedicated ClickHouse user with SELECT on the marts and staging databases only, under a settings profile whose limits it cannot raise — generate `CLICKHOUSE_AGENT_PASSWORD` alongside the other analytics secrets. Because it reads every user's activity, access is an explicit allowlist: with auth on, list the user ids or emails allowed to run it in `ANALYTICS_AGENT_ALLOWED_USERS` (empty denies everyone; single-user deployments are unaffected). Details in [`backend/agents/analytics_agent/README.md`](backend/agents/analytics_agent/README.md).
+
+Secrets live only in `.env` (gitignored); `gitleaks` runs on every commit.
+
+</details>
+
+<details>
+<summary><b>LLM configuration</b> — pick your models, run it for free or local</summary>
+
+<br/>
+
+Models are swappable **at runtime** — no rebuild. Open the in-app **Configuration** dialog and set **Main agent** / **Subagents** to a `<provider>:<model>` string (e.g. `anthropic:claude-sonnet-5`); leave blank to use the defaults. Settings persist in your browser's local storage.
+
+**Recommended:** Claude Sonnet 5, GPT-5.x, or Gemini 3.x — e.g. `anthropic:claude-sonnet-5`, `openai:gpt-5.6-terra`, `google_genai:gemini-3.5-flash`.
+
+**Run it for free or fully local:**
+
+- **Tavily** and **LlamaCloud** both include a generous monthly free tier — plenty for local use.
+- **Google AI Studio** offers a free tier for Gemini `flash` / `lite` models.
+- **Fully local** — point `OPENAI_API_BASE` at [LM Studio](https://lmstudio.ai/) or [Ollama](https://ollama.com/) (both expose an OpenAI-compatible API) and fill your local model in the UI.
+
+Output quality tracks the model you pick — smaller local models trade some quality for zero cost.
+
+</details>
+
+<details>
+<summary><b>Dev workflow</b> — hot reload, restart, rebuild, stop</summary>
+
+<br/>
+
+- **Code edits** hot-reload in both containers — just save the file.
+- **Add a frontend dep:** `pnpm --dir frontend add <pkg>` → `docker compose restart frontend`
+- **Add a backend dep:** `uv add <pkg>` → `docker compose up -d --build backend`
+- **Change `.env`:** `docker compose up -d <service>` (recreates the container with the new values)
+- **Stop:** `docker compose down` (add `-v` to wipe the DB, Redis, object-storage, warehouse, Dagster & Superset volumes)
+
+</details>
+
+## Architecture
+
+OfferMind is a **supervisor agent orchestrating three specialist subagents** on LangGraph + DeepAgents. The main agent handles intake, document processing, and the final battlecard; it delegates research, resume tailoring, and interview coaching to declarative subagents (defined in `subagents.yaml`, each with its own model, tools, and skills).
+
+![OfferMind architecture](docs/images/offermind-architecture.png)
+
+## How It Works
+
+A five-stage generation pipeline. Stage 4 runs the resume tailor and interview coach **in parallel**; after generation, Stage 6 routes follow-up edits to whichever agent owns the target file.
+
+![How OfferMind works](docs/images/offermind-how-it-works.png)
+
+<details>
+<summary><b>Stage-by-stage detail</b></summary>
+
+<br/>
+
+1. **Intake** — the agent asks for your CV, the JD (file, URL, or pasted text), your prep timeline, and any extra context.
+2. **Process documents** — uploads are parsed to markdown via LlamaParse (`parse_document`); JD URLs are pulled via Tavily (`extract_jd`). Results land in `/processed/`, alongside a persisted intake note.
+3. **Research** — the `hiring-recon` subagent gathers company + role intel and a match analysis → `/research/<resume>/<jd>.md`.
+4. **Tailor & coach (parallel)** — `resume-tailor` rewrites the CV as a `rendercv` YAML and renders a PDF; `interview-coach` writes a structured prep doc (self-intro + per-round STAR stories).
+5. **Battlecard** — the main agent assembles a one-page-per-round JSON and renders it to a day-of PDF via WeasyPrint.
+6. **Multi-turn updates** — ask for changes in chat; the owning agent reads the existing file, preserves everything you didn't name, and re-renders.
+
+The full procedure (file layout, update routing, source-of-truth conventions) lives in **[`backend/agents/career_agent/README.md`](backend/agents/career_agent/README.md)**. Per-feature design docs are in **[`docs/prd/`](docs/prd/)** — an OKF knowledge bundle you can render as an interactive graph; see [`docs/prd/README.md`](docs/prd/README.md).
+
+</details>
+
+<details>
+<summary><b>The DeepAgents stack</b> — an agent defined by filesystem primitives</summary>
+
+<br/>
+
+The agent's behavior is configured by files, not hardcoded — making it easy to read, diff, and extend:
+
+| Primitive | Where | Role | When loaded |
+| --- | --- | --- | --- |
+| **Memory** | `CAREER_AGENT.md` | Per-stage procedure manual (semantic memory) | Always (system prompt) |
+| **Skills** | `skills/<consumer>/<name>/SKILL.md` | Task workflows (procedural memory) | On demand, per consumer |
+| **Subagents** | `subagents.yaml` | Specialist delegates → the `task` tool | Always |
+| **Tools** | `tools.py` + DeepAgents built-ins | `parse_document`, `extract_jd`, `render_resume_pdf`, `render_battlecard_pdf`, `list_files`, plus `read/write/edit_file`, `ls/glob/grep`, `delete`, `execute` | — |
+| **Filesystem** | `CompositeBackend` | Routes virtual paths to the right store (see below) | — |
+| **Middleware** | `middleware.py` | `ModelOverrideMiddleware` (runtime LLM swap; opts Claude tool calls — direct API and Bedrock — into fine-grained arg streaming) + `UtcDatetimeMiddleware` | — |
+
+Subagents only receive the tools they opt into in YAML — tool whitelisting keeps `interview-coach`, for example, from inheriting the main agent's full toolset.
+
+</details>
+
+<details>
+<summary><b>Memory &amp; storage architecture</b></summary>
+
+<br/>
+
+A single `CompositeBackend` gives the agent one virtual filesystem while routing each path prefix to the right physical store — Postgres for text artifacts, S3-compatible object storage for uploads and rendered PDFs (SeaweedFS locally; S3 / GCS / Azure in the cloud), and a shell route for `execute` whose scratch space holds only render working files: a host shell backend by default, or an isolated remote sandbox (CubeSandbox / E2B) with `SANDBOX_PROVIDER=e2b`.
+
+```mermaid
+flowchart LR
+    Agent["Agent filesystem tools<br/>read_file · write_file · edit_file<br/>ls · glob · grep · execute"]
+    CB{{"CompositeBackend<br/>routes virtual paths"}}
+    Agent --> CB
+    subgraph Shell["Shell default route · SANDBOX_PROVIDER"]
+        SH["execute — local: host subprocess,<br/>/virtual/path → on-disk path ·<br/>e2b: remote E2B microVM<br/>(CubeSandbox self-hosted / E2B Cloud)<br/>renders run in a throwaway scratch dir"]
+    end
+    subgraph Store["StoreBackend · Postgres + pgvector"]
+        ST["/memory/ · /processed/ · /research/<br/>/interview_coach/<br/>/large_tool_results/ · /workspace/"]
+    end
+    subgraph Obj["ObjectStoreBackend · S3-compatible<br/>SeaweedFS local · S3/GCS/Azure cloud"]
+        OB["/upload/ · /tailored_resume/<br/>/interview_battlecard/"]
+    end
+    CB -->|default: shell + scratch| Shell
+    CB -->|KV routes| Store
+    CB -->|artifact routes| Obj
+    Sem["Semantic memory · CAREER_AGENT.md"] -. loaded into system prompt .-> Agent
+    Proc["Procedural memory · skills/*/SKILL.md"] -. loaded on demand .-> Agent
+    Work["Working memory · LangGraph thread"] -. drives .-> Agent
+    Store --- Epi["Episodic memory · persisted artifacts<br/>(incl. /memory/ auto-memory)"]
+    Obj --- Epi
+```
+
+Mapped to memory types:
+
+- **Working memory** — the live LangGraph conversation thread.
+- **Semantic memory** — `CAREER_AGENT.md`, always in the system prompt.
+- **Procedural memory** — `skills/*/SKILL.md`, loaded on demand.
+- **Episodic memory** — persisted artifacts in Postgres + disk, including *auto-memory*: standing preferences saved to the `/memory/` route and auto-applied across sessions.
+
+</details>
+
+<a name="authentication--multi-user"></a>
+
+<details>
+<summary><b>Authentication &amp; multi-user</b> — opt-in login &amp; per-user isolation</summary>
+
+<br/>
+
+OfferMind runs **zero-login single-user by default** — `docker compose up` and start prepping, no accounts. Flip on **multi-user mode** for a shared or cloud deployment and every user gets private threads, files, and memory.
+
+- **Login** — Google OAuth and/or email + password, via self-hosted [Better Auth](https://better-auth.com) inside the Next.js app (its tables live in your Postgres; no third-party auth vendor).
+- **Isolation** — the agent server verifies a short-lived JWT (JWKS) on every request; threads/runs/crons are owner-scoped in SQL (unowned → `404`), and store namespaces + object keys are scoped per user (`users/<id>/…`). Design details in [`backend/ARCHITECTURE.md` §8](backend/ARCHITECTURE.md#8-authentication--multi-user).
+
+**Enable it** — set these in `.env`, then `docker compose up -d frontend backend`:
+
+1. `AUTH_ENABLED=true` and `BETTER_AUTH_SECRET=$(openssl rand -base64 32)`.
+2. Create the Better Auth tables once (it owns `user` / `session` / `account` / `jwks`, separate from `backend/storage/migrations/`). Pin the CLI (`auth` on npm) to the `better-auth` version in `frontend/package.json`:
+   ```bash
+   AUTH_DATABASE_URL="postgresql://<POSTGRES_USER>:<POSTGRES_PASSWORD>@localhost:<POSTGRES_LOCAL_PORT>/<POSTGRES_DB>" \
+   BETTER_AUTH_SECRET=<same secret> \
+     pnpm --dir frontend dlx auth@1.7.2 migrate --config src/lib/auth/server.ts
+   ```
+   **Upgrading a deployment that already has accounts from Better Auth ≤ 1.6:** 1.7 keys every account on `(issuer, accountId)` and the CLI cannot add that `NOT NULL` column to a populated table. Back up the auth tables (`pg_dump -t '"user"' -t account -t session -t verification -t jwks`), stop the frontend, run the backfill script, then the `migrate` command above (it adds the new `jwks` columns), then start the frontend on 1.7:
+   ```bash
+   docker compose exec -T postgres psql -U <POSTGRES_USER> -d <POSTGRES_DB> -v ON_ERROR_STOP=1 -f - \
+     < frontend/scripts/better-auth-1.7-account-issuer-backfill.sql   # or: psql "$AUTH_DATABASE_URL" -f <script>
+   ```
+   The script maps `credential` → `local:credential` and `google` → `https://accounts.google.com`, and aborts (schema untouched) on any other provider or on an identity collision — see [Better Auth's 1.7 upgrade guide](https://better-auth.com/docs/guides/1-7-upgrade-guide).
+3. `LANGGRAPH_AUTH` — turns on backend enforcement. (Login without this is fine for trying the UI, but provides no isolation.) One line:
+
+   ```env
+   LANGGRAPH_AUTH={"path": "/deps/offermind/backend/agents/auth.py:auth", "disable_studio_auth": true, "openapi": {"securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "JWT", "description": "Better Auth session JWT. While signed in, the frontend's GET /api/auth/token returns one."}}, "security": [{"bearerAuth": []}], "paths": {"/ok": {"GET": []}, "/info": {"GET": []}, "/metrics": {"GET": []}, "/docs": {"GET": []}}}}
+   ```
+
+   The optional `"openapi"` block documents auth in the API reference: `/docs` gets a Bearer Token field for authenticated Test Requests (paste a JWT from the frontend's `GET /api/auth/token`), while the public meta endpoints (`/ok`, `/info`, `/metrics`, `/docs`) stay marked auth-free.
+4. *Optional Google sign-in:* `AUTH_GOOGLE_ENABLED=true` + `GOOGLE_AUTH_CLIENT_ID` / `GOOGLE_AUTH_CLIENT_SECRET` (OAuth client redirect URI `http://localhost:<FRONTEND_LOCAL_PORT>/api/auth/callback/google`). Email + password works without it.
+
+<details>
+<summary><b>Cloud hardening checklist</b> — beyond enabling auth</summary>
+
+<br/>
+
+- **`REQUIRE_AUTH=true`** — the backend refuses to boot if `LANGGRAPH_AUTH` is missing, so a misconfigured deploy fails loudly instead of serving everyone's data.
+- **HTTPS everywhere** — set `BETTER_AUTH_URL` / `AUTH_JWT_ISSUER` / `AUTH_JWT_AUDIENCE` to the public https origin, and `AUTH_JWKS_URL` to the in-network frontend URL the backend can reach.
+- **Pin CORS** — `CORS_ALLOW_ORIGINS=https://your-frontend.example` (the default `*` is local-only).
+- **Block the unauthenticated meta routes** at the ingress — `/metrics` leaks thread/run counts; also `/docs`, `/openapi.json`, `/info`.
+- **Gate MCP / A2A** — authentication-only today (no per-resource authz), so disable via `LANGGRAPH_HTTP` `"disable_mcp": true` / `"disable_a2a": true` until audited.
+- **Close the Studio backdoors** — never set `LANGSMITH_LANGGRAPH_API_VARIANT=local_dev` in production; `disable_studio_auth: true` (above) closes the header-based one.
+- **Reverse proxy** must never forward a client-controlled root_path (the in-process `/noauth` loopback bypass stays internal-only).
+
+</details>
+
+</details>
+
+<details>
+<summary><b>Tech stack</b></summary>
+
+<br/>
+
+| Layer | Stack |
+| --- | --- |
+| **Backend** | Python 3.13 · LangChain v1 · LangGraph 1.x · DeepAgents · `uv` · served by OfferMind's own self-hosted agent server ([`backend/ARCHITECTURE.md`](backend/ARCHITECTURE.md)) |
+| **Agent I/O** | Tavily (web search) · LlamaParse / LlamaCloud (document parsing) · `rendercv` (resume → PDF) · WeasyPrint (battlecard → PDF) |
+| **Frontend** | Next.js 16 · React 19 · TypeScript · Tailwind · `pnpm` · `@langchain/react` (v2 `useStream`) |
+| **Data** | PostgreSQL 18 + pgvector · Redis 8 · S3-compatible object storage (SeaweedFS locally; S3 / GCS / Azure in the cloud) |
+| **Infra** | Docker Compose (app services · PostgreSQL · Redis · object storage · ClickHouse · Dagster · dbt docs · Cube · Superset) |
+| **Observability** | LangSmith |
+
+</details>
+
+<details>
+<summary><b>Expose the agent</b> — MCP &amp; A2A</summary>
+
+<br/>
+
+Because OfferMind ships its own **agent server** implementing the LangGraph Server API (see [`backend/ARCHITECTURE.md`](backend/ARCHITECTURE.md)), the `career_agent` assistant is also reachable by other tools and agents — no extra code:
+
+- **MCP** — exposed as Model Context Protocol tools at **`/mcp`** (Streamable HTTP), usable by any MCP-compliant client. → [docs](https://docs.langchain.com/langsmith/server-mcp)
+- **A2A** — Google's Agent2Agent protocol at **`/a2a/{assistant_id}`** (JSON-RPC 2.0; `message/send` + `message/stream`). → [docs](https://docs.langchain.com/langsmith/server-a2a)
+- The full server API is browsable at the **`/docs`** endpoint of your deployment.
+
+> In multi-user mode these endpoints are authentication-gated but not yet per-user authorized — disable them (`disable_mcp` / `disable_a2a`) in a shared deployment until that lands. See [`backend/ARCHITECTURE.md` §8](backend/ARCHITECTURE.md#8-authentication--multi-user).
+
+![OfferMind Agent Expose](docs/images/offermind-agent-expose.png)
+
+</details>
+
+<details>
+<summary><b>Observability</b> — LangSmith tracing</summary>
+
+<br/>
+
+Set `LANGCHAIN_API_KEY` and `LANGCHAIN_TRACING_V2=true` in `.env`, and every run — each LLM call, tool call, and nested subagent — is traced at [smith.langchain.com](https://smith.langchain.com/) under the `LANGCHAIN_PROJECT` you configure. Optional, but invaluable for debugging the multi-agent flow.
+
+</details>
+
+## Roadmap
+
+- 💤 **"Auto-dream" consolidation** — sleep-time compaction that prunes stale notes and merges insights into durable memory.
+- 🔐 **Wider `execute` allowlist in sandbox mode** — remote sandboxes shipped (`SANDBOX_PROVIDER=e2b` → self-hosted [CubeSandbox](https://github.com/TencentCloud/CubeSandbox) or E2B Cloud); next, let sandboxed deployments auto-approve more than the conservative read-only list.
+- 📊 **Agent evaluation** — LangSmith evals over the workflow (the `@pytest.mark.eval` marker is already reserved).
+- 🎨 **Enhanced UI** — richer artifact editing, diff views, and inline regeneration.
+- 🔌 **MCP / A2A examples** — sample integrations driving `career_agent` from external agents and IDEs.
+- ☁️ **Cloud deployment** — binary artifacts already live in S3-compatible object storage (SeaweedFS locally; point `OBJECT_STORE_*` at S3 / GCS / Azure). Remaining: managed bucket provisioning (versioning, SSE, IAM) and presigned-URL delivery.
+- 🌐 **More sources & ATS-aware tailoring** — pluggable retrievers + keyword/ATS optimization passes.
+
+## Limitations
+
+> Multi-user mode isolates data; before opening signups to untrusted users, also move shell execution off the default local mode (`SANDBOX_PROVIDER=e2b`).
+
+- 🔒 **Local shell execution is the default** — with `SANDBOX_PROVIDER=local`, `execute` and render commands run via `subprocess` on the host (HiL-gated). Safe locally and for a trusted team; for untrusted multi-tenant use switch to `e2b` so every command runs in an isolated microVM ([`deploy/cubesandbox/`](deploy/cubesandbox/README.md)).
+- 🧪 **LLM evals deferred** — current tests are unit + local-DB integration; automated quality evals aren't wired up yet.
+- 🧠 **Personalization is preferences-only** — the agent persists and auto-applies the preferences you *state* across sessions, but doesn't yet infer your style/history on its own or consolidate memory over time (see [roadmap](#roadmap)).
+- ⏱️ **Latency** — a full run makes several LLM and tool calls across multiple agents; expect minutes, not seconds.
+
+## 🗺️ Explore the codebase graph
+
+This repo ships a pre-built architecture knowledge graph in [`.ua/`](.ua) — the whole codebase mapped by [Understand-Anything](https://github.com/Egonex-AI/Understand-Anything) into 1,100+ nodes across 10 architectural layers, with a guided tour. Browse it as an interactive dashboard:
+
+<details>
+<summary><b>Open the dashboard</b> — one command, nothing to install</summary>
+
+<br/>
+
+```bash
+# From the repo root — needs only Node.js (no install, no clone, no build):
+npx --yes "https://github.com/Egonex-AI/Understand-Anything/releases/latest/download/understand-anything-viewer.tgz" .
+```
+
+Open the printed `🔑 Dashboard URL` (include the `?token=…` — the plain URL hits an access gate).
+
+> Using Claude Code? Install the [understand-anything](https://github.com/Egonex-AI/Understand-Anything) plugin and run `/understand-dashboard` in this repo instead.
+
+The graph is **for humans**: AI coding assistants are configured to ignore `.ua/` (Claude Code deny rules, `.cursorignore`, a `CLAUDE.md` instruction) so they keep reading the real source instead of a large generated snapshot.
+
+![OfferMind codebase knowledge graph — architectural layers, dependencies, and project stats in the Understand-Anything dashboard](docs/images/offermind-understand-anything.png)
+
+</details>
+
+The same treatment exists for the product's *design history*: every feature ships with a PRD in [`docs/prd/`](docs/prd/) — an [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf) knowledge bundle whose committed interactive graph (`docs/prd/viz.html`) maps how features extend and supersede each other. The codebase graph maps the *code*; the PRD graph maps the *decisions*. See [`docs/prd/README.md`](docs/prd/README.md) to browse or regenerate it.
+
+## Contributing
+
+PRs and issues are welcome! Start with **[`CONTRIBUTING.md`](CONTRIBUTING.md)** — it walks through the fork → PR workflow, local setup, the CI quality gate (code quality + backend tests + frontend tests), testing, and conventions. Stack-specific details live in [`backend/CLAUDE.md`](backend/CLAUDE.md), [`frontend/CLAUDE.md`](frontend/CLAUDE.md), and [`analytics/CLAUDE.md`](analytics/CLAUDE.md); commits follow [Conventional Commits](https://www.conventionalcommits.org/).
+
+New here? Issues labelled [`good first issue`](https://github.com/Moneyxia0525/OfferMind/labels/good%20first%20issue) are a gentle place to start, and questions are welcome in [Discussions](https://github.com/Moneyxia0525/OfferMind/discussions).
+
+## License
+
+[MIT](LICENSE) © 2026 MoneyXia
+
+## Acknowledgements
+
+Built on [DeepAgents](https://github.com/langchain-ai/deepagents), [LangChain / LangGraph / LangSmith](https://github.com/langchain-ai), [rendercv](https://github.com/rendercv/rendercv), [WeasyPrint](https://github.com/Kozea/WeasyPrint), [Tavily](https://tavily.com/), and [LlamaIndex / LlamaParse](https://github.com/run-llama/llama_index).

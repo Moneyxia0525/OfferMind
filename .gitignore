@@ -1,0 +1,20 @@
+.env
+.ruff_cache
+CLAUDE.local.md
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# dbt build artifacts (analytics/)
+analytics/dbt/target/
+analytics/dbt/logs/
+analytics/dbt/dbt_packages/
+analytics/dbt/.user.yml
+
+# Understand-Anything graph: ship the graph, not its rebuild artifacts
+.ua/intermediate/
+.ua/diff-overlay.json
+.ua/.trash-*/
