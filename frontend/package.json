@@ -67,7 +67,7 @@
     "@testing-library/user-event": "^14.6.7",
     "@types/node": "^24.13.3",
     "@types/pg": "^8.23.1",
-    "@types/plotly.js": "^3.0.13",
+    "@types/plotly.js": "^3.0.15",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
     "@types/react-plotly.js": "^2.6.4",
